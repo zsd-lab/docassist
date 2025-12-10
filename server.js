@@ -13,14 +13,47 @@ app.get("/", (req, res) => {
   res.send("Docs agent backend is running");
 });
 
-// Init OpenAI client with API key from env (Render: set OPENAI_API_KEY in dashboard)
+// Init OpenAI client with API key from env
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// ====== IN-MEMORY CHAT HISTORY STORE ======
+// docId -> [{ role: "user"|"assistant"|"system", content: string }, ... ]
+const historyStore = new Map();
+// max hány üzenetpárt tartsunk meg egy doksihoz (hogy ne nőjön végtelenre)
+const MAX_TURNS_PER_DOC = 10;
+
+/**
+ * Helper: get history array for a docId
+ */
+function getHistoryForDoc(docId) {
+  if (!historyStore.has(docId)) {
+    historyStore.set(docId, []);
+  }
+  return historyStore.get(docId);
+}
+
+/**
+ * Helper: push (role, content) to a doc's history, és limitáljuk a hosszát.
+ */
+function appendToHistory(docId, role, content) {
+  const history = getHistoryForDoc(docId);
+  history.push({ role, content });
+
+  // Ha túl hosszú, vágjuk meg az elejéről
+  const maxMessages = MAX_TURNS_PER_DOC * 2; // user+assistant per turn
+  if (history.length > maxMessages) {
+    const extra = history.length - maxMessages;
+    history.splice(0, extra);
+  }
+
+  historyStore.set(docId, history);
+}
+
 /**
  * ONE-SHOT FUNCTION
- * Uses gpt-5.1 to process a given text with an instruction (your existing flow).
+ * Uses gpt-5.1 to process a given text with an instruction (existing flow).
  */
 async function runDocsAgent(text, instruction) {
   const model = "gpt-5.1";
@@ -67,17 +100,25 @@ Guidelines:
 }
 
 /**
- * CHAT WITH DOCUMENT FUNCTION
- * Receives:
- * - docId: Google Docs document ID (for logging / future use)
+ * CHAT WITH DOCUMENT FUNCTION (server-side history)
+ *
+ * - docId: Google Docs document ID
  * - docText: full document text
- * - history: [{role: "user"|"assistant", content: string}, ...]
- * Returns a reply that continues the conversation and uses the document as context.
+ * - userMessage: current user question/instruction
+ *
+ * A history-t a szerver tartja `historyStore`-ban.
  */
-async function runChatWithDoc(docId, docText, history) {
+async function runChatWithDoc(docId, docText, userMessage) {
   const model = "gpt-5.1";
 
-  // We inject document content as system context, plus the conversation history
+  // 1) betöltjük a meglévő history-t
+  const history = getHistoryForDoc(docId);
+
+  // 2) összerakjuk a messages array-t:
+  //    - system info
+  //    - document content mint context
+  //    - eddigi history (user+assistant)
+  //    - mostani user message
   const messages = [
     {
       role: "system",
@@ -100,10 +141,11 @@ Your job:
       role: "system",
       content: `Here is the current document content:\n\n${docText}`,
     },
-    // Then the conversation history (user + assistant turns)
     ...history,
+    { role: "user", content: userMessage },
   ];
 
+  // 3) hívjuk a modellt
   const response = await client.chat.completions.create({
     model,
     messages,
@@ -118,7 +160,13 @@ Your job:
     throw new Error("No content in model response.");
   }
 
-  return msg.content.trim();
+  const reply = msg.content.trim();
+
+  // 4) history frissítése a szerveren
+  appendToHistory(docId, "user", userMessage);
+  appendToHistory(docId, "assistant", reply);
+
+  return reply;
 }
 
 /**
@@ -148,26 +196,26 @@ app.post("/docs-agent", async (req, res) => {
 });
 
 /**
- * ROUTE: Chat with Document
+ * ROUTE: Chat with Document (server-side history)
  * POST /chat-docs
  * body: {
  *   docId: string,
  *   docText: string,
- *   history: [{ role: "user"|"assistant", content: string }]
+ *   userMessage: string
  * }
  * reply: { reply: string }
  */
 app.post("/chat-docs", async (req, res) => {
   try {
-    const { docId, docText, history } = req.body;
+    const { docId, docText, userMessage } = req.body;
 
-    if (!docText || !Array.isArray(history)) {
+    if (!docId || !docText || !userMessage) {
       return res.status(400).json({
-        error: "Missing 'docText' or 'history' (Array) in body.",
+        error: "Missing 'docId', 'docText' or 'userMessage' in body.",
       });
     }
 
-    const answer = await runChatWithDoc(docId, docText, history);
+    const answer = await runChatWithDoc(docId, docText, userMessage);
     res.json({ reply: answer });
   } catch (err) {
     console.error(err);
