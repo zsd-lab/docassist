@@ -1,0 +1,7 @@
+POST http://localhost:3000/docs-agent
+Content-Type: application/json
+
+{
+  "text": "Ez egy nagyon hosszú szöveg, amit szeretnék összefoglalni.",
+  "instruction": "Foglaljad össze magyarul."
+}
