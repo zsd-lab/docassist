@@ -14,6 +14,9 @@ app.use(express.json());
 // ====== POSTGRES POOL ======
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
 // ====== KONFIG ======
@@ -262,7 +265,7 @@ app.post("/chat-docs", async (req, res) => {
     res.status(500).json({
       error: err.message || "Internal server error",
     });
-  }
+  }0
 });
 
 const PORT = process.env.PORT || 3000;
