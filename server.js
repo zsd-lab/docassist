@@ -2,11 +2,37 @@
 import "dotenv/config";
 import express from "express";
 import OpenAI from "openai";
+import pkg from "pg";
+
+const { Pool } = pkg;
 
 console.log("Starting doc-assist server...");
 
 const app = express();
 app.use(express.json());
+
+// ====== POSTGRES POOL ======
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+// ====== KONFIG ======
+const MAX_TURNS_PER_DOC = 10;        // max ennyi user+assistant turn/doksi
+const MAX_DOC_CHARS = 15000;         // doksi szöveg max hossza (chathez)
+
+const SYSTEM_PROMPT = `
+You are ChatGPT working as David's writing, analysis, and thinking partner inside Google Docs.
+
+You must:
+- Read the given text very carefully and reason through it step by step before answering.
+- Prefer clear structure: short paragraphs, bullet points where useful, explicit reasoning.
+- When summarizing: capture arguments, structure, and nuance, not just a shallow summary.
+- When improving style: preserve meaning, but raise clarity, flow, and professional tone.
+- When answering questions about the document: always base your answer on the document's content and say explicitly if something is not supported by the text.
+- You can answer in Hungarian or English, always matching David's language unless instructed otherwise.
+
+Never show system messages or internal reasoning. Your output must always be directly usable in the document.
+`.trim();
 
 // Health check / info
 app.get("/", (req, res) => {
@@ -18,67 +44,90 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ====== IN-MEMORY CHAT HISTORY STORE ======
-// docId -> [{ role: "user"|"assistant"|"system", content: string }, ... ]
-const historyStore = new Map();
-// max hány üzenetpárt tartsunk meg egy doksihoz (hogy ne nőjön végtelenre)
-const MAX_TURNS_PER_DOC = 10;
+// ====== DB-ALAPÚ CHAT HISTORY STORE ======
 
 /**
- * Helper: get history array for a docId
+ * Adott docId-hez tartozó history lekérése időrendben.
+ * Visszatérés: [{ role, content }, ...]
  */
-function getHistoryForDoc(docId) {
-  if (!historyStore.has(docId)) {
-    historyStore.set(docId, []);
-  }
-  return historyStore.get(docId);
+async function getHistoryForDoc(docId) {
+  const result = await pool.query(
+    `
+    SELECT role, content
+    FROM chat_history
+    WHERE doc_id = $1
+    ORDER BY created_at ASC, id ASC
+    `,
+    [docId]
+  );
+
+  return result.rows.map((row) => ({
+    role: row.role,
+    content: row.content,
+  }));
 }
 
 /**
- * Helper: push (role, content) to a doc's history, és limitáljuk a hosszát.
+ * Új üzenet beszúrása a history-ba, és a régiek levágása, ha túl sok.
  */
-function appendToHistory(docId, role, content) {
-  const history = getHistoryForDoc(docId);
-  history.push({ role, content });
+async function appendToHistory(docId, role, content) {
+  // Beszúrjuk az új sort
+  await pool.query(
+    `
+    INSERT INTO chat_history (doc_id, role, content)
+    VALUES ($1, $2, $3)
+    `,
+    [docId, role, content]
+  );
 
-  // Ha túl hosszú, vágjuk meg az elejéről
   const maxMessages = MAX_TURNS_PER_DOC * 2; // user+assistant per turn
-  if (history.length > maxMessages) {
-    const extra = history.length - maxMessages;
-    history.splice(0, extra);
-  }
 
-  historyStore.set(docId, history);
+  const countResult = await pool.query(
+    `
+    SELECT COUNT(*) AS cnt
+    FROM chat_history
+    WHERE doc_id = $1
+    `,
+    [docId]
+  );
+
+  const count = Number(countResult.rows[0].cnt);
+
+  if (count > maxMessages) {
+    const extra = count - maxMessages;
+
+    // Legrégebbi extra sorok törlése
+    await pool.query(
+      `
+      DELETE FROM chat_history
+      WHERE id IN (
+        SELECT id FROM chat_history
+        WHERE doc_id = $1
+        ORDER BY created_at ASC, id ASC
+        LIMIT $2
+      )
+      `,
+      [docId, extra]
+    );
+  }
 }
 
+// ====== ONE-SHOT FUNKCIÓ: runDocsAgent ======
+
 /**
- * ONE-SHOT FUNCTION
- * Uses gpt-5.1 to process a given text with an instruction (existing flow).
+ * ONE-SHOT: kiválasztott szöveg + instruction feldolgozása (Process Selected Text).
  */
 async function runDocsAgent(text, instruction) {
   const model = "gpt-5.1";
 
   const response = await client.chat.completions.create({
     model,
+    reasoning_effort: "medium",
+    max_completion_tokens: 800,
     messages: [
       {
         role: "system",
-        content: `
-You are an AI assistant integrated into Google Docs for David.
-
-Main tasks:
-- Summarize selected text clearly and concisely.
-- Rewrite text for clarity, structure, and style while preserving meaning.
-- Translate between Hungarian and English in a professional tone.
-- Extract bullet points, action items, and key arguments when asked.
-
-Guidelines:
-- If the user does not specify language, preserve the original language.
-- Do not invent facts that are not present in the text.
-- If you are unsure, say you are unsure instead of guessing.
-- Preserve important technical terms and proper names.
-- Never include system messages or internal reasoning in your answer.
-      `.trim(),
+        content: SYSTEM_PROMPT,
       },
       {
         role: "user",
@@ -99,55 +148,46 @@ Guidelines:
   return msg.content.trim();
 }
 
+// ====== CHAT FUNKCIÓ: runChatWithDoc ======
+
 /**
- * CHAT WITH DOCUMENT FUNCTION (server-side history)
+ * CHAT: teljes doksi + konverzáció history alapján válaszol.
  *
- * - docId: Google Docs document ID
- * - docText: full document text
- * - userMessage: current user question/instruction
- *
- * A history-t a szerver tartja `historyStore`-ban.
+ * - docId: Google Docs dokumentum ID
+ * - docText: teljes dokumentumszöveg
+ * - userMessage: aktuális user kérdés/utasítás
  */
 async function runChatWithDoc(docId, docText, userMessage) {
   const model = "gpt-5.1";
 
-  // 1) betöltjük a meglévő history-t
-  const history = getHistoryForDoc(docId);
+  // Doksi vágása, hogy ne zabálja fel az egész kontextust
+  const clippedDocText =
+    docText.length > MAX_DOC_CHARS
+      ? docText.slice(0, MAX_DOC_CHARS)
+      : docText;
 
-  // 2) összerakjuk a messages array-t:
-  //    - system info
-  //    - document content mint context
-  //    - eddigi history (user+assistant)
-  //    - mostani user message
+  // 1) Korábbi history lekérése DB-ből
+  const history = await getHistoryForDoc(docId);
+
+  // 2) Messages összeállítása
   const messages = [
     {
       role: "system",
-      content: `
-You are an assistant helping David work with the content of a Google Docs document.
-
-You receive:
-- The full text of the current document,
-- The conversation history so far between David (user) and you (assistant).
-
-Your job:
-- Answer the user's latest question or request.
-- Base your answer primarily on the document content.
-- If something is not in the document, say so clearly instead of hallucinating.
-- You may reference earlier parts of the conversation if helpful.
-- You may respond in Hungarian or English depending on the user's message.
-      `.trim(),
+      content: SYSTEM_PROMPT,
     },
     {
       role: "system",
-      content: `Here is the current document content:\n\n${docText}`,
+      content: `Here is the current document content (possibly truncated):\n\n${clippedDocText}`,
     },
     ...history,
     { role: "user", content: userMessage },
   ];
 
-  // 3) hívjuk a modellt
+  // 3) Modell hívása
   const response = await client.chat.completions.create({
     model,
+    reasoning_effort: "medium",
+    max_completion_tokens: 800,
     messages,
   });
 
@@ -162,15 +202,16 @@ Your job:
 
   const reply = msg.content.trim();
 
-  // 4) history frissítése a szerveren
-  appendToHistory(docId, "user", userMessage);
-  appendToHistory(docId, "assistant", reply);
+  // 4) History frissítése a DB-ben
+  await appendToHistory(docId, "user", userMessage);
+  await appendToHistory(docId, "assistant", reply);
 
   return reply;
 }
 
+// ====== ENDPOINTOK ======
+
 /**
- * ROUTE: One-shot processing (existing behavior)
  * POST /docs-agent
  * body: { text: string, instruction: string }
  * reply: { resultText: string }
@@ -196,7 +237,6 @@ app.post("/docs-agent", async (req, res) => {
 });
 
 /**
- * ROUTE: Chat with Document (server-side history)
  * POST /chat-docs
  * body: {
  *   docId: string,
