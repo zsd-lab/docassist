@@ -20,8 +20,8 @@ const pool = new Pool({
 });
 
 // ====== KONFIG ======
-const MAX_TURNS_PER_DOC = 10;        // max ennyi user+assistant turn/doksi
-const MAX_DOC_CHARS = 15000;         // doksi szöveg max hossza (chathez)
+const MAX_TURNS_PER_DOC = 25;        // max ennyi user+assistant turn/doksi
+const MAX_DOC_CHARS = 50000;         // doksi szöveg max hossza (chathez)
 
 const SYSTEM_PROMPT = `
 You are ChatGPT working as David's writing, analysis, and thinking partner inside Google Docs.
@@ -125,8 +125,8 @@ async function runDocsAgent(text, instruction) {
 
   const response = await client.chat.completions.create({
     model,
-    reasoning_effort: "medium",
-    max_completion_tokens: 800,
+    reasoning_effort: "high",
+    max_completion_tokens: 1200,
     messages: [
       {
         role: "system",
@@ -189,8 +189,8 @@ async function runChatWithDoc(docId, docText, userMessage) {
   // 3) Modell hívása
   const response = await client.chat.completions.create({
     model,
-    reasoning_effort: "medium",
-    max_completion_tokens: 800,
+    reasoning_effort: "high",
+    max_completion_tokens: 1200,
     messages,
   });
 
