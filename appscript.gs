@@ -135,6 +135,7 @@ function getChatSidebarHtml_() {
 
     <script>
       const el = (id) => document.getElementById(id);
+      const TICK = String.fromCharCode(96);
 
       function escapeHtml(s) {
         return String(s || '')
@@ -150,7 +151,8 @@ function getChatSidebarHtml_() {
         let t = escapeHtml(text);
 
         // Inline code first to avoid formatting inside code spans.
-        t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+        const inlineCodeRe = new RegExp(TICK + '([^' + TICK + ']+)' + TICK, 'g');
+        t = t.replace(inlineCodeRe, '<code>$1</code>');
 
         // Bold / italic (simple, common cases)
         t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -165,7 +167,8 @@ function getChatSidebarHtml_() {
         let last = 0;
 
         // Handle fenced code blocks ```lang?\n...```
-        const fenceRe = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+        const fence = TICK + TICK + TICK;
+        const fenceRe = new RegExp(fence + '([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)' + fence, 'g');
         let m;
         while ((m = fenceRe.exec(src)) !== null) {
           out += renderBlocks_(src.slice(last, m.index));
