@@ -39,7 +39,7 @@ const pool = new Pool({
 const MAX_TURNS_PER_DOC = 25;        // max ennyi user+assistant turn/doksi
 const MAX_DOC_CHARS = 50000;         // doksi szöveg max hossza (chathez)
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2-2025-12-11";
 
 const SYSTEM_PROMPT = `
 You are ChatGPT working as David's writing, analysis, and thinking partner inside Google Docs.
@@ -131,7 +131,14 @@ async function getOrCreateSession(docId, maybeInstructions) {
       row.instructions = incoming;
     }
 
-    if (!row.model) row.model = OPENAI_MODEL;
+    // Keep stored session model aligned with current env config.
+    if (!row.model || row.model !== OPENAI_MODEL) {
+      await pool.query(
+        `UPDATE docs_sessions SET model = $2, updated_at = NOW() WHERE doc_id = $1`,
+        [docId, OPENAI_MODEL]
+      );
+      row.model = OPENAI_MODEL;
+    }
     return row;
   }
 
