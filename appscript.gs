@@ -52,25 +52,39 @@ function getChatSidebarHtml_() {
       .role { font-weight: 700; margin-right: 6px; }
       .status { color: #5f6368; font-size: 12px; min-height: 16px; }
       .small { font-size: 12px; color: #5f6368; }
+      details { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; background: #fff; }
+      summary { cursor: pointer; font-weight: 600; }
+      summary::-webkit-details-marker { display: none; }
+      .details-body { margin-top: 10px; }
     </style>
   </head>
   <body>
     <h2>GPT-5.2 Chat</h2>
 
     <div class="row">
-      <label>Backend URL</label>
-      <input id="baseUrl" type="text" placeholder="https://your-server.example.com" />
-      <div class="small">Stored in Script Properties as <code>DOCASSIST_BASE_URL</code>.</div>
-    </div>
+      <details id="settings">
+        <summary>Connection settings</summary>
+        <div class="details-body">
+          <div class="row">
+            <label>Backend URL</label>
+            <input id="baseUrl" type="text" placeholder="https://your-server.example.com" />
+            <div class="small">Stored in Script Properties as <code>DOCASSIST_BASE_URL</code>.</div>
+          </div>
 
-    <div class="row">
-      <label>Backend Token (optional)</label>
-      <input id="token" type="password" placeholder="Bearer token" />
-      <div class="small">Stored in Script Properties as <code>DOCASSIST_TOKEN</code>.</div>
+          <div class="row">
+            <label>Backend Token (optional)</label>
+            <input id="token" type="password" placeholder="Token (not including 'Bearer')" />
+            <div class="small">Stored in Script Properties as <code>DOCASSIST_TOKEN</code>.</div>
+          </div>
+
+          <div class="row controls">
+            <button id="saveSettingsBtn">Save Settings</button>
+          </div>
+        </div>
+      </details>
     </div>
 
     <div class="row controls">
-      <button id="saveSettingsBtn">Save Settings</button>
       <button id="syncBtn">Sync Document</button>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="autoSync" type="checkbox" />
@@ -138,10 +152,12 @@ function getChatSidebarHtml_() {
       function loadState() {
         setStatus('Loading settings...');
         google.script.run.withSuccessHandler((state) => {
+          const settingsEl = document.getElementById('settings');
           el('baseUrl').value = state.baseUrl || '';
           el('token').value = state.token || '';
           el('instructions').value = state.instructions || '';
-          setStatus(state.baseUrl ? 'Ready.' : 'Set Backend URL first.');
+          if (settingsEl) settingsEl.open = !state.baseUrl;
+          setStatus(state.baseUrl ? 'Ready.' : 'Set Backend URL first (open Connection settings).');
         }).withFailureHandler((err) => {
           setStatus('Error loading state: ' + (err && err.message ? err.message : err));
         }).getSidebarState();
