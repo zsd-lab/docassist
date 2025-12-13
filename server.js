@@ -518,6 +518,16 @@ app.post("/v2/chat", async (req, res) => {
 
     const session = await getOrCreateSession(String(docId), typeof instructions === "string" ? instructions : "");
 
+    // If the user asks which model is being used, answer from backend config (authoritative).
+    const msgStr = String(userMessage || "");
+    const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
+    if (askedModel) {
+      return res.json({
+        reply: `A backend szerint ezzel a modellel hívlak: ${session.model || OPENAI_MODEL}`,
+        responseId: "local-model-info",
+      });
+    }
+
     const response = await client.responses.create({
       model: session.model || OPENAI_MODEL,
       conversation: session.conversation_id,
@@ -528,7 +538,7 @@ app.post("/v2/chat", async (req, res) => {
           vector_store_ids: [session.vector_store_id],
         },
       ],
-      input: String(userMessage),
+      input: msgStr,
       max_output_tokens: 1200,
     });
 
