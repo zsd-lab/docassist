@@ -56,6 +56,15 @@ function getChatSidebarHtml_() {
       summary { cursor: pointer; font-weight: 600; }
       summary::-webkit-details-marker { display: none; }
       .details-body { margin-top: 10px; }
+
+      /* Rendered markdown inside chat */
+      .chat p { margin: 6px 0; }
+      .chat h1, .chat h2, .chat h3, .chat h4, .chat h5, .chat h6 { margin: 10px 0 6px; font-size: 13px; }
+      .chat ul, .chat ol { margin: 6px 0; padding-left: 18px; }
+      .chat li { margin: 2px 0; }
+      .chat code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
+      .chat pre { margin: 8px 0; padding: 8px; border: 1px solid #dadce0; border-radius: 6px; background: #fff; overflow: auto; }
+      .chat pre code { white-space: pre; }
     </style>
   </head>
   <body>
@@ -127,6 +136,116 @@ function getChatSidebarHtml_() {
     <script>
       const el = (id) => document.getElementById(id);
 
+      function escapeHtml(s) {
+        return String(s || '')
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function renderInlineMarkdown(text) {
+        // Start from escaped text so we never allow raw HTML injection.
+        let t = escapeHtml(text);
+
+        // Inline code first to avoid formatting inside code spans.
+        t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+        // Bold / italic (simple, common cases)
+        t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        t = t.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, '$1<em>$2</em>');
+
+        return t;
+      }
+
+      function renderMarkdown(md) {
+        const src = String(md || '').replace(/\r\n/g, '\n');
+        let out = '';
+        let last = 0;
+
+        // Handle fenced code blocks ```lang?\n...```
+        const fenceRe = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+        let m;
+        while ((m = fenceRe.exec(src)) !== null) {
+          out += renderBlocks_(src.slice(last, m.index));
+          const code = escapeHtml(m[2]);
+          out += `<pre><code>${code}</code></pre>`;
+          last = fenceRe.lastIndex;
+        }
+        out += renderBlocks_(src.slice(last));
+        return out;
+      }
+
+      function renderBlocks_(text) {
+        const lines = String(text || '').split('\n');
+        let html = '';
+        let paragraph = [];
+        let inUl = false;
+        let inOl = false;
+
+        const flushParagraph = () => {
+          if (!paragraph.length) return;
+          const content = renderInlineMarkdown(paragraph.join('\n')).replace(/\n/g, '<br/>');
+          html += `<p>${content}</p>`;
+          paragraph = [];
+        };
+
+        const closeLists = () => {
+          if (inUl) { html += '</ul>'; inUl = false; }
+          if (inOl) { html += '</ol>'; inOl = false; }
+        };
+
+        for (const rawLine of lines) {
+          const line = rawLine.replace(/\s+$/g, '');
+
+          // Blank line: end paragraph / lists
+          if (!line.trim()) {
+            flushParagraph();
+            closeLists();
+            continue;
+          }
+
+          // Headings (# .. ######)
+          const h = line.match(/^(#{1,6})\s+(.+)$/);
+          if (h) {
+            flushParagraph();
+            closeLists();
+            const level = h[1].length;
+            html += `<h${level}>${renderInlineMarkdown(h[2].trim())}</h${level}>`;
+            continue;
+          }
+
+          // Unordered list item
+          const ul = line.match(/^\s*[-*]\s+(.+)$/);
+          if (ul) {
+            flushParagraph();
+            if (inOl) { html += '</ol>'; inOl = false; }
+            if (!inUl) { html += '<ul>'; inUl = true; }
+            html += `<li>${renderInlineMarkdown(ul[1])}</li>`;
+            continue;
+          }
+
+          // Ordered list item
+          const ol = line.match(/^\s*\d+\.\s+(.+)$/);
+          if (ol) {
+            flushParagraph();
+            if (inUl) { html += '</ul>'; inUl = false; }
+            if (!inOl) { html += '<ol>'; inOl = true; }
+            html += `<li>${renderInlineMarkdown(ol[1])}</li>`;
+            continue;
+          }
+
+          // Normal paragraph line
+          closeLists();
+          paragraph.push(line);
+        }
+
+        flushParagraph();
+        closeLists();
+        return html;
+      }
+
       function setStatus(text) {
         el('status').textContent = text || '';
       }
@@ -138,7 +257,14 @@ function getChatSidebarHtml_() {
         roleSpan.className = 'role';
         roleSpan.textContent = role + ':';
         const textSpan = document.createElement('span');
-        textSpan.textContent = text;
+
+        // Render assistant as (safe) markdown; keep user as plain text.
+        if (role && String(role).toLowerCase().includes('gpt')) {
+          textSpan.innerHTML = renderMarkdown(text);
+        } else {
+          textSpan.innerHTML = escapeHtml(text).replace(/\n/g, '<br/>');
+        }
+
         div.appendChild(roleSpan);
         div.appendChild(textSpan);
         el('chat').appendChild(div);
