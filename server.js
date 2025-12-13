@@ -10,7 +10,9 @@ const { Pool } = pkg;
 console.log("Starting doc-assist server...");
 
 const app = express();
-app.use(express.json());
+const BODY_LIMIT = process.env.DOCASSIST_BODY_LIMIT || "25mb";
+app.use(express.json({ limit: BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 
 // ====== AUTH (optional) ======
 // If DOCASSIST_TOKEN is set, require: Authorization: Bearer <token>
@@ -636,6 +638,18 @@ app.post("/v2/chat", async (req, res) => {
     console.error(err);
     return res.status(500).json({ error: err.message || "Internal server error" });
   }
+});
+
+// ====== ERROR HANDLING ======
+// Ensure oversized JSON bodies return JSON (Apps Script expects JSON).
+app.use((err, req, res, next) => {
+  const isTooLarge = err && (err.type === "entity.too.large" || err.status === 413);
+  if (isTooLarge) {
+    return res.status(413).json({
+      error: `Payload Too Large. Increase DOCASSIST_BODY_LIMIT (current: ${BODY_LIMIT}).`,
+    });
+  }
+  return next(err);
 });
 
 const PORT = process.env.PORT || 3000;
