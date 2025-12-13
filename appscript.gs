@@ -170,7 +170,7 @@ function getChatSidebarHtml_() {
         while ((m = fenceRe.exec(src)) !== null) {
           out += renderBlocks_(src.slice(last, m.index));
           const code = escapeHtml(m[2]);
-          out += `<pre><code>${code}</code></pre>`;
+          out += '<pre><code>' + code + '</code></pre>';
           last = fenceRe.lastIndex;
         }
         out += renderBlocks_(src.slice(last));
@@ -187,7 +187,7 @@ function getChatSidebarHtml_() {
         const flushParagraph = () => {
           if (!paragraph.length) return;
           const content = renderInlineMarkdown(paragraph.join('\n')).replace(/\n/g, '<br/>');
-          html += `<p>${content}</p>`;
+          html += '<p>' + content + '</p>';
           paragraph = [];
         };
 
@@ -212,7 +212,7 @@ function getChatSidebarHtml_() {
             flushParagraph();
             closeLists();
             const level = h[1].length;
-            html += `<h${level}>${renderInlineMarkdown(h[2].trim())}</h${level}>`;
+            html += '<h' + level + '>' + renderInlineMarkdown(h[2].trim()) + '</h' + level + '>';
             continue;
           }
 
@@ -222,7 +222,7 @@ function getChatSidebarHtml_() {
             flushParagraph();
             if (inOl) { html += '</ol>'; inOl = false; }
             if (!inUl) { html += '<ul>'; inUl = true; }
-            html += `<li>${renderInlineMarkdown(ul[1])}</li>`;
+            html += '<li>' + renderInlineMarkdown(ul[1]) + '</li>';
             continue;
           }
 
@@ -232,7 +232,7 @@ function getChatSidebarHtml_() {
             flushParagraph();
             if (inUl) { html += '</ul>'; inUl = false; }
             if (!inOl) { html += '<ol>'; inOl = true; }
-            html += `<li>${renderInlineMarkdown(ol[1])}</li>`;
+            html += '<li>' + renderInlineMarkdown(ol[1]) + '</li>';
             continue;
           }
 
