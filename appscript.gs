@@ -10,6 +10,7 @@
 function onOpen() {
   DocumentApp.getUi().createMenu('Assistant')
     .addItem('Open Chat Sidebar', 'showChatSidebar')
+    .addItem('Open Chat (wide window)', 'showChatDialog')
     .addItem('Reset Doc Assist (this document)', 'resetDocAssistForThisDocument')
     .addSeparator()
     .addItem('Sync Document to Knowledge', 'syncDocumentToKnowledge')
@@ -132,6 +133,18 @@ function showChatSidebar() {
   DocumentApp.getUi().showSidebar(html);
 }
 
+function showChatDialog() {
+  const html = HtmlService
+    .createHtmlOutput(getChatSidebarHtml_())
+    .setTitle('Assistant Chat');
+
+  // Dialogs can be wider than sidebars.
+  // Note: Docs UI may still enforce max sizes depending on screen.
+  html.setWidth(900).setHeight(800);
+
+  DocumentApp.getUi().showModelessDialog(html, 'Assistant Chat');
+}
+
 function getChatSidebarHtml_() {
   return String.raw`
 <!doctype html>
@@ -140,8 +153,7 @@ function getChatSidebarHtml_() {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: Arial, sans-serif; font-size: 13px; margin: 12px; }
-      h2 { font-size: 14px; margin: 0 0 8px; }
+      body { font-family: Arial, sans-serif; font-size: 13px; margin: 12px; height: 100vh; box-sizing: border-box; display: flex; flex-direction: column; }
       .row { margin-bottom: 10px; }
       label { display: block; font-weight: 600; margin-bottom: 4px; }
       input[type="text"], input[type="password"], textarea {
@@ -152,7 +164,9 @@ function getChatSidebarHtml_() {
       button.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
       button:disabled { opacity: 0.6; cursor: not-allowed; }
       .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-      .chat { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; height: 260px; overflow: auto; background: #fafafa; }
+      .top-area { height: clamp(620px, calc(100vh - 220px), 950px); display: flex; flex-direction: column; }
+      .chat { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; flex: 1 1 auto; overflow: auto; background: #fafafa; min-height: 340px; }
+      #msg { min-height: 110px; max-height: 180px; }
       .msg { margin: 8px 0; }
       .role { font-weight: 700; margin-right: 6px; }
       .status { color: #5f6368; font-size: 12px; min-height: 16px; }
@@ -173,7 +187,49 @@ function getChatSidebarHtml_() {
     </style>
   </head>
   <body>
-    <h2>Assistant Chat</h2>
+    <div class="top-area">
+      <div class="row">
+        <label>Chat</label>
+        <div id="chat" class="chat"></div>
+      </div>
+
+      <div class="row">
+        <label>Your message</label>
+        <textarea id="msg" placeholder="Ask something about the doc, or request edits..."></textarea>
+        <div class="controls" style="margin-top:6px;">
+          <button id="sendBtn" class="primary">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="row controls">
+      <button id="syncBtn">Sync Document</button>
+      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
+        <input id="autoSync" type="checkbox" />
+        Auto-sync before sending
+      </label>
+    </div>
+
+    <div class="row">
+      <label>Files</label>
+      <input id="fileInput" type="file" />
+      <div class="controls" style="margin-top:6px;">
+        <button id="uploadBtn">Upload File</button>
+      </div>
+      <div class="small">Uploads and indexes the file for file search.</div>
+    </div>
+
+    <div class="row">
+      <details id="instructionsDetails">
+        <summary>Project instructions (system message)</summary>
+        <div class="details-body">
+          <textarea id="instructions" placeholder="Long instructions (like ChatGPT Project instructions)"></textarea>
+          <div class="controls" style="margin-top:6px;">
+            <button id="saveInstrBtn">Save Instructions</button>
+          </div>
+        </div>
+      </details>
+    </div>
 
     <div class="row">
       <details id="settings">
@@ -196,44 +252,6 @@ function getChatSidebarHtml_() {
           </div>
         </div>
       </details>
-    </div>
-
-    <div class="row controls">
-      <button id="syncBtn">Sync Document</button>
-      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
-        <input id="autoSync" type="checkbox" />
-        Auto-sync before sending
-      </label>
-    </div>
-
-    <div class="row">
-      <label>Project instructions (system message)</label>
-      <textarea id="instructions" placeholder="Long instructions (like ChatGPT Project instructions)"></textarea>
-      <div class="controls" style="margin-top:6px;">
-        <button id="saveInstrBtn">Save Instructions</button>
-      </div>
-    </div>
-
-    <div class="row">
-      <label>Files</label>
-      <input id="fileInput" type="file" />
-      <div class="controls" style="margin-top:6px;">
-        <button id="uploadBtn">Upload File</button>
-      </div>
-      <div class="small">Uploads and indexes the file for file search.</div>
-    </div>
-
-    <div class="row">
-      <label>Chat</label>
-      <div id="chat" class="chat"></div>
-    </div>
-
-    <div class="row">
-      <label>Your message</label>
-      <textarea id="msg" placeholder="Ask something about the doc, or request edits..."></textarea>
-      <div class="controls" style="margin-top:6px;">
-        <button id="sendBtn" class="primary">Send</button>
-      </div>
     </div>
 
     <div id="status" class="status"></div>
@@ -368,7 +386,9 @@ function getChatSidebarHtml_() {
         const textSpan = document.createElement('span');
 
         // Render assistant as (safe) markdown; keep user as plain text.
-        if (role && String(role).toLowerCase().includes('gpt')) {
+        const roleLower = String(role || '').toLowerCase();
+        const isAssistant = roleLower === 'assistant' || roleLower.includes('assistant') || roleLower.includes('gpt');
+        if (isAssistant) {
           textSpan.innerHTML = renderMarkdown(text);
         } else {
           textSpan.innerHTML = escapeHtml(text).replace(/\n/g, '<br/>');
