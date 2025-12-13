@@ -43,6 +43,15 @@ const MAX_DOC_CHARS = 50000;         // doksi szöveg max hossza (chathez)
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2-2025-12-11";
 
+const DEFAULT_MAX_OUTPUT_TOKENS = 1200;
+const MAX_OUTPUT_TOKENS = (() => {
+  const raw = process.env.DOCASSIST_MAX_OUTPUT_TOKENS;
+  if (raw == null || String(raw).trim() === "") return DEFAULT_MAX_OUTPUT_TOKENS;
+  const parsed = Number.parseInt(String(raw), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_OUTPUT_TOKENS;
+  return parsed;
+})();
+
 const SYSTEM_PROMPT = `
 SYSTEM PROMPT (kiegészített): “Agilis Coach Power & Impact – Erste (Daily Banking + Enterprise Influence)”
 Te egy szervezetfejlesztési (OD) szakértő, IT/agilis transzformációs tanácsadó, business coach és executive-asszisztens szerepben működő AI ügynök vagy. A felhasználód Zsigó Dávid (Agile Coach, Erste Bank Magyarország, Agile Center of Excellence; Daily Banking Tribe dedikált coach).
@@ -354,7 +363,7 @@ async function runDocsAgent(text, instruction) {
   const response = await client.chat.completions.create({
     model,
     reasoning_effort: "high",
-    max_completion_tokens: 1200,
+    max_completion_tokens: MAX_OUTPUT_TOKENS,
     messages: [
       {
         role: "system",
@@ -418,7 +427,7 @@ async function runChatWithDoc(docId, docText, userMessage) {
   const response = await client.chat.completions.create({
     model,
     reasoning_effort: "high",
-    max_completion_tokens: 1200,
+    max_completion_tokens: MAX_OUTPUT_TOKENS,
     messages,
   });
 
@@ -627,7 +636,7 @@ app.post("/v2/chat", async (req, res) => {
         },
       ],
       input: msgStr,
-      max_output_tokens: 1200,
+      max_output_tokens: MAX_OUTPUT_TOKENS,
     });
 
     return res.json({
@@ -658,6 +667,7 @@ await ensureTables();
 app.listen(PORT, () => {
   console.log(`Docs agent backend listening on port ${PORT}`);
   console.log(`OpenAI model: ${OPENAI_MODEL}`);
+  console.log(`Max output tokens: ${MAX_OUTPUT_TOKENS} (set DOCASSIST_MAX_OUTPUT_TOKENS to change)`);
   if (DOCASSIST_TOKEN) console.log("Auth: enabled (DOCASSIST_TOKEN)");
   else console.log("Auth: disabled (set DOCASSIST_TOKEN to enable)");
 });
