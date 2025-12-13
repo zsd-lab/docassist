@@ -18,6 +18,83 @@ function onOpen() {
     .addToUi();
 }
 
+// ====== MINIMAL SERVER-SIDE LOGGING ======
+
+function log_(event, meta) {
+  try {
+    const payload = {
+      ts: new Date().toISOString(),
+      event: String(event || ''),
+      meta: sanitizeForLog_(meta)
+    };
+    console.log(JSON.stringify(payload));
+  } catch (e) {
+    // Never fail the user flow because logging failed.
+  }
+}
+
+function sanitizeForLog_(value) {
+  const maxStr = 200;
+  const maxKeys = 30;
+
+  const redactKey = (k) => {
+    const key = String(k || '').toLowerCase();
+    return key.includes('token') || key.includes('authorization') || key.includes('apikey') || key.includes('api_key');
+  };
+
+  const clip = (s) => {
+    const str = String(s);
+    if (str.length <= maxStr) return str;
+    return str.slice(0, maxStr) + `…(+${str.length - maxStr} chars)`;
+  };
+
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return clip(value);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+
+  // Avoid dumping huge blobs
+  if (value && typeof value === 'object') {
+    if (value instanceof Date) return value.toISOString();
+
+    if (Array.isArray(value)) {
+      return {
+        _type: 'array',
+        length: value.length
+      };
+    }
+
+    const out = {};
+    const keys = Object.keys(value).slice(0, maxKeys);
+    keys.forEach((k) => {
+      if (redactKey(k)) {
+        out[k] = '[REDACTED]';
+        return;
+      }
+      const v = value[k];
+      if (k === 'contentBase64') {
+        out[k] = v ? `[base64 ${String(v).length} chars]` : '';
+        return;
+      }
+      if (k === 'docText') {
+        out[k] = v ? `[docText ${String(v).length} chars]` : '';
+        return;
+      }
+      if (k === 'instructions' || k === 'userMessage') {
+        out[k] = v ? clip(v) : '';
+        return;
+      }
+      out[k] = sanitizeForLog_(v);
+    });
+
+    if (Object.keys(value).length > keys.length) {
+      out._truncatedKeys = Object.keys(value).length - keys.length;
+    }
+    return out;
+  }
+
+  return String(value);
+}
+
 // ====== V2 SIDEBAR (ChatGPT-like) ======
 
 function showChatSidebar() {
@@ -28,7 +105,7 @@ function showChatSidebar() {
 }
 
 function getChatSidebarHtml_() {
-  return `
+  return String.raw`
 <!doctype html>
 <html>
   <head>
@@ -137,15 +214,6 @@ function getChatSidebarHtml_() {
       const el = (id) => document.getElementById(id);
       const TICK = String.fromCharCode(96);
 
-      function safeMsg_(v) {
-        try {
-          if (v && typeof v === 'object' && 'message' in v) return String(v.message);
-          return String(v);
-        } catch (e) {
-          return 'Unknown error';
-        }
-      }
-
       function escapeHtml(s) {
         return String(s || '')
           .replace(/&/g, '&amp;')
@@ -178,6 +246,7 @@ function getChatSidebarHtml_() {
         // Handle fenced code blocks (triple-backtick style)
         const fence = TICK + TICK + TICK;
         const fenceRe = new RegExp(fence + '([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)' + fence, 'g');
+
         let m;
         while ((m = fenceRe.exec(src)) !== null) {
           out += renderBlocks_(src.slice(last, m.index));
@@ -262,14 +331,6 @@ function getChatSidebarHtml_() {
         el('status').textContent = text || '';
       }
 
-      window.addEventListener('error', (ev) => {
-        setStatus('JS error: ' + safeMsg_(ev && ev.message ? ev.message : ev));
-      });
-
-      window.addEventListener('unhandledrejection', (ev) => {
-        setStatus('Promise error: ' + safeMsg_(ev && ev.reason ? ev.reason : ev));
-      });
-
       function addMsg(role, text) {
         const div = document.createElement('div');
         div.className = 'msg';
@@ -292,10 +353,7 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn'].forEach((id) => {
-          const node = el(id);
-          if (node) node.disabled = disabled;
-        });
+        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn'].forEach(id => el(id).disabled = disabled);
       }
 
       function loadState() {
@@ -312,133 +370,104 @@ function getChatSidebarHtml_() {
         }).getSidebarState();
       }
 
-      function init() {
-        try {
-          if (!(window.google && google.script && google.script.run)) {
-            setStatus('Sidebar error: google.script.run is unavailable (not running in Apps Script context).');
-            return;
-          }
+      el('saveSettingsBtn').addEventListener('click', () => {
+        disableAll(true);
+        setStatus('Saving settings...');
+        google.script.run.withSuccessHandler(() => {
+          setStatus('Settings saved.');
+          disableAll(false);
+        }).withFailureHandler((err) => {
+          setStatus('Error saving settings: ' + (err && err.message ? err.message : err));
+          disableAll(false);
+        }).saveSidebarSettings(el('baseUrl').value, el('token').value);
+      });
 
-          const saveSettingsBtn = el('saveSettingsBtn');
-          const saveInstrBtn = el('saveInstrBtn');
-          const syncBtn = el('syncBtn');
-          const uploadBtn = el('uploadBtn');
-          const sendBtn = el('sendBtn');
+      el('saveInstrBtn').addEventListener('click', () => {
+        disableAll(true);
+        setStatus('Saving instructions...');
+        google.script.run.withSuccessHandler(() => {
+          setStatus('Instructions saved.');
+          disableAll(false);
+        }).withFailureHandler((err) => {
+          setStatus('Error saving instructions: ' + (err && err.message ? err.message : err));
+          disableAll(false);
+        }).saveProjectInstructions(el('instructions').value);
+      });
 
-          if (!saveSettingsBtn || !saveInstrBtn || !syncBtn || !uploadBtn || !sendBtn) {
-            setStatus('Sidebar error: missing UI elements. Try closing and reopening the sidebar.');
-            return;
-          }
+      el('syncBtn').addEventListener('click', () => {
+        disableAll(true);
+        setStatus('Syncing document...');
+        google.script.run.withSuccessHandler(() => {
+          setStatus('Document synced.');
+          disableAll(false);
+        }).withFailureHandler((err) => {
+          setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
+          disableAll(false);
+        }).syncDocumentToKnowledge(el('instructions').value);
+      });
 
-          saveSettingsBtn.addEventListener('click', () => {
-            disableAll(true);
-            setStatus('Saving settings...');
-            google.script.run.withSuccessHandler(() => {
-              setStatus('Settings saved.');
-              disableAll(false);
-            }).withFailureHandler((err) => {
-              setStatus('Error saving settings: ' + safeMsg_(err));
-              disableAll(false);
-            }).saveSidebarSettings(el('baseUrl').value, el('token').value);
-          });
-
-          saveInstrBtn.addEventListener('click', () => {
-            disableAll(true);
-            setStatus('Saving instructions...');
-            google.script.run.withSuccessHandler(() => {
-              setStatus('Instructions saved.');
-              disableAll(false);
-            }).withFailureHandler((err) => {
-              setStatus('Error saving instructions: ' + safeMsg_(err));
-              disableAll(false);
-            }).saveProjectInstructions(el('instructions').value);
-          });
-
-          syncBtn.addEventListener('click', () => {
-            disableAll(true);
-            setStatus('Syncing document...');
-            google.script.run.withSuccessHandler(() => {
-              setStatus('Document synced.');
-              disableAll(false);
-            }).withFailureHandler((err) => {
-              setStatus('Error syncing document: ' + safeMsg_(err));
-              disableAll(false);
-            }).syncDocumentToKnowledge(el('instructions').value);
-          });
-
-          uploadBtn.addEventListener('click', async () => {
-            try {
-              const file = el('fileInput').files && el('fileInput').files[0];
-              if (!file) {
-                setStatus('Choose a file first.');
-                return;
-              }
-              disableAll(true);
-              setStatus('Reading file...');
-              const base64 = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onerror = () => reject(reader.error);
-                reader.onload = () => {
-                  const dataUrl = String(reader.result || '');
-                  const comma = dataUrl.indexOf(',');
-                  resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
-                };
-                reader.readAsDataURL(file);
-              });
-
-              setStatus('Uploading file...');
-              google.script.run.withSuccessHandler(() => {
-                setStatus('File uploaded and indexed.');
-                disableAll(false);
-              }).withFailureHandler((err) => {
-                setStatus('Error uploading: ' + safeMsg_(err));
-                disableAll(false);
-              }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value);
-            } catch (err) {
-              setStatus('Upload failed: ' + safeMsg_(err));
-              disableAll(false);
-            }
-          });
-
-          sendBtn.addEventListener('click', () => {
-            const text = (el('msg').value || '').trim();
-            if (!text) return;
-            el('msg').value = '';
-            addMsg('You', text);
-            disableAll(true);
-
-            const doSend = () => {
-              setStatus('Thinking...');
-              google.script.run.withSuccessHandler((reply) => {
-                addMsg('GPT-5.2', reply || '(empty)');
-                setStatus('Ready.');
-                disableAll(false);
-              }).withFailureHandler((err) => {
-                setStatus('Error: ' + safeMsg_(err));
-                disableAll(false);
-              }).sendChatMessage(text, el('instructions').value);
-            };
-
-            if (el('autoSync') && el('autoSync').checked) {
-              setStatus('Auto-syncing document...');
-              google.script.run.withSuccessHandler(() => doSend())
-                .withFailureHandler((err) => {
-                  setStatus('Auto-sync failed: ' + safeMsg_(err));
-                  disableAll(false);
-                })
-                .syncDocumentToKnowledge(el('instructions').value);
-            } else {
-              doSend();
-            }
-          });
-
-          loadState();
-        } catch (err) {
-          setStatus('Init error: ' + safeMsg_(err));
+      el('uploadBtn').addEventListener('click', async () => {
+        const file = el('fileInput').files && el('fileInput').files[0];
+        if (!file) {
+          setStatus('Choose a file first.');
+          return;
         }
-      }
+        disableAll(true);
+        setStatus('Reading file...');
+        const base64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(reader.error);
+          reader.onload = () => {
+            const dataUrl = String(reader.result || '');
+            const comma = dataUrl.indexOf(',');
+            resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
+          };
+          reader.readAsDataURL(file);
+        });
 
-      init();
+        setStatus('Uploading file...');
+        google.script.run.withSuccessHandler(() => {
+          setStatus('File uploaded and indexed.');
+          disableAll(false);
+        }).withFailureHandler((err) => {
+          setStatus('Error uploading: ' + (err && err.message ? err.message : err));
+          disableAll(false);
+        }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value);
+      });
+
+      el('sendBtn').addEventListener('click', () => {
+        const text = (el('msg').value || '').trim();
+        if (!text) return;
+        el('msg').value = '';
+        addMsg('You', text);
+        disableAll(true);
+
+        const doSend = () => {
+          setStatus('Thinking...');
+          google.script.run.withSuccessHandler((reply) => {
+            addMsg('GPT-5.2', reply || '(empty)');
+            setStatus('Ready.');
+            disableAll(false);
+          }).withFailureHandler((err) => {
+            setStatus('Error: ' + (err && err.message ? err.message : err));
+            disableAll(false);
+          }).sendChatMessage(text, el('instructions').value);
+        };
+
+        if (el('autoSync').checked) {
+          setStatus('Auto-syncing document...');
+          google.script.run.withSuccessHandler(() => doSend())
+            .withFailureHandler((err) => {
+              setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+            })
+            .syncDocumentToKnowledge(el('instructions').value);
+        } else {
+          doSend();
+        }
+      });
+
+      loadState();
     </script>
   </body>
 </html>
@@ -446,23 +475,45 @@ function getChatSidebarHtml_() {
 }
 
 function getSidebarState() {
+  const started = Date.now();
   const props = PropertiesService.getScriptProperties();
   const baseUrl = props.getProperty('DOCASSIST_BASE_URL') || '';
   const token = props.getProperty('DOCASSIST_TOKEN') || '';
   const docProps = PropertiesService.getDocumentProperties();
   const instructions = docProps.getProperty('DOCASSIST_INSTRUCTIONS') || '';
+
+  log_('sidebar.get_state', {
+    hasBaseUrl: Boolean(baseUrl),
+    hasToken: Boolean(token),
+    instructionsLen: String(instructions || '').length,
+    ms: Date.now() - started
+  });
+
   return { baseUrl: baseUrl, token: token, instructions: instructions };
 }
 
 function saveSidebarSettings(baseUrl, token) {
+  const started = Date.now();
   const props = PropertiesService.getScriptProperties();
   props.setProperty('DOCASSIST_BASE_URL', String(baseUrl || '').trim());
   props.setProperty('DOCASSIST_TOKEN', String(token || '').trim());
+
+  log_('sidebar.save_settings', {
+    hasBaseUrl: Boolean(String(baseUrl || '').trim()),
+    hasToken: Boolean(String(token || '').trim()),
+    ms: Date.now() - started
+  });
 }
 
 function saveProjectInstructions(instructions) {
+  const started = Date.now();
   const docProps = PropertiesService.getDocumentProperties();
   docProps.setProperty('DOCASSIST_INSTRUCTIONS', String(instructions || ''));
+
+  log_('sidebar.save_instructions', {
+    instructionsLen: String(instructions || '').length,
+    ms: Date.now() - started
+  });
 }
 
 function getProjectInstructions_() {
@@ -485,6 +536,7 @@ function getBackendToken_() {
 }
 
 function callBackendV2_(path, payload) {
+  const started = Date.now();
   const url = getBackendBaseUrl_() + path;
   const token = getBackendToken_();
 
@@ -507,59 +559,119 @@ function callBackendV2_(path, payload) {
   try {
     json = JSON.parse(responseText);
   } catch (err) {
+    log_('v2.call.invalid_json', {
+      path: path,
+      url: url,
+      responseCode: responseCode,
+      responseTextSample: String(responseText || '').slice(0, 300),
+      ms: Date.now() - started
+    });
     throw new Error('Backend returned invalid JSON: ' + responseText);
   }
 
   if (responseCode < 200 || responseCode >= 300) {
     const errorMsg = json && json.error ? json.error : responseText;
+
+    log_('v2.call.error', {
+      path: path,
+      url: url,
+      responseCode: responseCode,
+      error: errorMsg,
+      ms: Date.now() - started
+    });
+
     throw new Error(errorMsg + ' (HTTP ' + responseCode + ')');
   }
+
+  log_('v2.call.ok', {
+    path: path,
+    url: url,
+    responseCode: responseCode,
+    ms: Date.now() - started
+  });
 
   return json;
 }
 
 function ensureV2Session_(instructionsOverride) {
+  const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
-  return callBackendV2_('/v2/init', {
+
+  const result = callBackendV2_('/v2/init', {
     docId: doc.getId(),
     instructions: instructions
   });
+
+  log_('v2.ensure_session', {
+    docId: doc.getId(),
+    instructionsLen: String(instructions || '').length,
+    ms: Date.now() - started
+  });
+
+  return result;
 }
 
 function syncDocumentToKnowledge(instructionsOverride) {
+  const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const docText = doc.getBody().getText();
   if (!docText || !docText.trim()) {
+    log_('v2.sync_doc.empty', { docId: doc.getId() });
     throw new Error('This document is empty.');
   }
 
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
   ensureV2Session_(instructions);
 
-  return callBackendV2_('/v2/sync-doc', {
+  const resp = callBackendV2_('/v2/sync-doc', {
     docId: doc.getId(),
     docTitle: doc.getName(),
     docText: docText,
     instructions: instructions
   });
+
+  log_('v2.sync_doc', {
+    docId: doc.getId(),
+    docTitle: doc.getName(),
+    docTextLen: String(docText || '').length,
+    instructionsLen: String(instructions || '').length,
+    reused: Boolean(resp && resp.reused),
+    ms: Date.now() - started
+  });
+
+  return resp;
 }
 
 function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOverride) {
+  const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
   ensureV2Session_(instructions);
 
-  return callBackendV2_('/v2/upload-file', {
+  const resp = callBackendV2_('/v2/upload-file', {
     docId: doc.getId(),
     filename: filename,
     mimeType: mimeType,
     contentBase64: contentBase64,
     instructions: instructions
   });
+
+  log_('v2.upload_file', {
+    docId: doc.getId(),
+    filename: filename,
+    mimeType: mimeType,
+    base64Len: String(contentBase64 || '').length,
+    instructionsLen: String(instructions || '').length,
+    reused: Boolean(resp && resp.reused),
+    ms: Date.now() - started
+  });
+
+  return resp;
 }
 
 function sendChatMessage(userMessage, instructionsOverride) {
+  const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
   ensureV2Session_(instructions);
@@ -568,6 +680,14 @@ function sendChatMessage(userMessage, instructionsOverride) {
     docId: doc.getId(),
     userMessage: String(userMessage || ''),
     instructions: instructions
+  });
+
+  log_('v2.chat', {
+    docId: doc.getId(),
+    userMessageLen: String(userMessage || '').length,
+    instructionsLen: String(instructions || '').length,
+    replyLen: resp && resp.reply ? String(resp.reply).length : 0,
+    ms: Date.now() - started
   });
 
   return String(resp.reply || '');
