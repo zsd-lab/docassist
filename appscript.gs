@@ -137,6 +137,15 @@ function getChatSidebarHtml_() {
       const el = (id) => document.getElementById(id);
       const TICK = String.fromCharCode(96);
 
+      function safeMsg_(v) {
+        try {
+          if (v && typeof v === 'object' && 'message' in v) return String(v.message);
+          return String(v);
+        } catch (e) {
+          return 'Unknown error';
+        }
+      }
+
       function escapeHtml(s) {
         return String(s || '')
           .replace(/&/g, '&amp;')
@@ -166,7 +175,7 @@ function getChatSidebarHtml_() {
         let out = '';
         let last = 0;
 
-        // Handle fenced code blocks ```lang?\n...```
+        // Handle fenced code blocks (triple-backtick style)
         const fence = TICK + TICK + TICK;
         const fenceRe = new RegExp(fence + '([a-zA-Z0-9_-]+)?\\n([\\s\\S]*?)' + fence, 'g');
         let m;
@@ -253,6 +262,14 @@ function getChatSidebarHtml_() {
         el('status').textContent = text || '';
       }
 
+      window.addEventListener('error', (ev) => {
+        setStatus('JS error: ' + safeMsg_(ev && ev.message ? ev.message : ev));
+      });
+
+      window.addEventListener('unhandledrejection', (ev) => {
+        setStatus('Promise error: ' + safeMsg_(ev && ev.reason ? ev.reason : ev));
+      });
+
       function addMsg(role, text) {
         const div = document.createElement('div');
         div.className = 'msg';
@@ -275,7 +292,10 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn'].forEach(id => el(id).disabled = disabled);
+        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn'].forEach((id) => {
+          const node = el(id);
+          if (node) node.disabled = disabled;
+        });
       }
 
       function loadState() {
@@ -292,104 +312,133 @@ function getChatSidebarHtml_() {
         }).getSidebarState();
       }
 
-      el('saveSettingsBtn').addEventListener('click', () => {
-        disableAll(true);
-        setStatus('Saving settings...');
-        google.script.run.withSuccessHandler(() => {
-          setStatus('Settings saved.');
-          disableAll(false);
-        }).withFailureHandler((err) => {
-          setStatus('Error saving settings: ' + (err && err.message ? err.message : err));
-          disableAll(false);
-        }).saveSidebarSettings(el('baseUrl').value, el('token').value);
-      });
+      function init() {
+        try {
+          if (!(window.google && google.script && google.script.run)) {
+            setStatus('Sidebar error: google.script.run is unavailable (not running in Apps Script context).');
+            return;
+          }
 
-      el('saveInstrBtn').addEventListener('click', () => {
-        disableAll(true);
-        setStatus('Saving instructions...');
-        google.script.run.withSuccessHandler(() => {
-          setStatus('Instructions saved.');
-          disableAll(false);
-        }).withFailureHandler((err) => {
-          setStatus('Error saving instructions: ' + (err && err.message ? err.message : err));
-          disableAll(false);
-        }).saveProjectInstructions(el('instructions').value);
-      });
+          const saveSettingsBtn = el('saveSettingsBtn');
+          const saveInstrBtn = el('saveInstrBtn');
+          const syncBtn = el('syncBtn');
+          const uploadBtn = el('uploadBtn');
+          const sendBtn = el('sendBtn');
 
-      el('syncBtn').addEventListener('click', () => {
-        disableAll(true);
-        setStatus('Syncing document...');
-        google.script.run.withSuccessHandler(() => {
-          setStatus('Document synced.');
-          disableAll(false);
-        }).withFailureHandler((err) => {
-          setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
-          disableAll(false);
-        }).syncDocumentToKnowledge(el('instructions').value);
-      });
+          if (!saveSettingsBtn || !saveInstrBtn || !syncBtn || !uploadBtn || !sendBtn) {
+            setStatus('Sidebar error: missing UI elements. Try closing and reopening the sidebar.');
+            return;
+          }
 
-      el('uploadBtn').addEventListener('click', async () => {
-        const file = el('fileInput').files && el('fileInput').files[0];
-        if (!file) {
-          setStatus('Choose a file first.');
-          return;
-        }
-        disableAll(true);
-        setStatus('Reading file...');
-        const base64 = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onerror = () => reject(reader.error);
-          reader.onload = () => {
-            const dataUrl = String(reader.result || '');
-            const comma = dataUrl.indexOf(',');
-            resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
-          };
-          reader.readAsDataURL(file);
-        });
-
-        setStatus('Uploading file...');
-        google.script.run.withSuccessHandler(() => {
-          setStatus('File uploaded and indexed.');
-          disableAll(false);
-        }).withFailureHandler((err) => {
-          setStatus('Error uploading: ' + (err && err.message ? err.message : err));
-          disableAll(false);
-        }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value);
-      });
-
-      el('sendBtn').addEventListener('click', () => {
-        const text = (el('msg').value || '').trim();
-        if (!text) return;
-        el('msg').value = '';
-        addMsg('You', text);
-        disableAll(true);
-
-        const doSend = () => {
-          setStatus('Thinking...');
-          google.script.run.withSuccessHandler((reply) => {
-            addMsg('GPT-5.2', reply || '(empty)');
-            setStatus('Ready.');
-            disableAll(false);
-          }).withFailureHandler((err) => {
-            setStatus('Error: ' + (err && err.message ? err.message : err));
-            disableAll(false);
-          }).sendChatMessage(text, el('instructions').value);
-        };
-
-        if (el('autoSync').checked) {
-          setStatus('Auto-syncing document...');
-          google.script.run.withSuccessHandler(() => doSend())
-            .withFailureHandler((err) => {
-              setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
+          saveSettingsBtn.addEventListener('click', () => {
+            disableAll(true);
+            setStatus('Saving settings...');
+            google.script.run.withSuccessHandler(() => {
+              setStatus('Settings saved.');
               disableAll(false);
-            })
-            .syncDocumentToKnowledge(el('instructions').value);
-        } else {
-          doSend();
-        }
-      });
+            }).withFailureHandler((err) => {
+              setStatus('Error saving settings: ' + safeMsg_(err));
+              disableAll(false);
+            }).saveSidebarSettings(el('baseUrl').value, el('token').value);
+          });
 
-      loadState();
+          saveInstrBtn.addEventListener('click', () => {
+            disableAll(true);
+            setStatus('Saving instructions...');
+            google.script.run.withSuccessHandler(() => {
+              setStatus('Instructions saved.');
+              disableAll(false);
+            }).withFailureHandler((err) => {
+              setStatus('Error saving instructions: ' + safeMsg_(err));
+              disableAll(false);
+            }).saveProjectInstructions(el('instructions').value);
+          });
+
+          syncBtn.addEventListener('click', () => {
+            disableAll(true);
+            setStatus('Syncing document...');
+            google.script.run.withSuccessHandler(() => {
+              setStatus('Document synced.');
+              disableAll(false);
+            }).withFailureHandler((err) => {
+              setStatus('Error syncing document: ' + safeMsg_(err));
+              disableAll(false);
+            }).syncDocumentToKnowledge(el('instructions').value);
+          });
+
+          uploadBtn.addEventListener('click', async () => {
+            try {
+              const file = el('fileInput').files && el('fileInput').files[0];
+              if (!file) {
+                setStatus('Choose a file first.');
+                return;
+              }
+              disableAll(true);
+              setStatus('Reading file...');
+              const base64 = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onerror = () => reject(reader.error);
+                reader.onload = () => {
+                  const dataUrl = String(reader.result || '');
+                  const comma = dataUrl.indexOf(',');
+                  resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
+                };
+                reader.readAsDataURL(file);
+              });
+
+              setStatus('Uploading file...');
+              google.script.run.withSuccessHandler(() => {
+                setStatus('File uploaded and indexed.');
+                disableAll(false);
+              }).withFailureHandler((err) => {
+                setStatus('Error uploading: ' + safeMsg_(err));
+                disableAll(false);
+              }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value);
+            } catch (err) {
+              setStatus('Upload failed: ' + safeMsg_(err));
+              disableAll(false);
+            }
+          });
+
+          sendBtn.addEventListener('click', () => {
+            const text = (el('msg').value || '').trim();
+            if (!text) return;
+            el('msg').value = '';
+            addMsg('You', text);
+            disableAll(true);
+
+            const doSend = () => {
+              setStatus('Thinking...');
+              google.script.run.withSuccessHandler((reply) => {
+                addMsg('GPT-5.2', reply || '(empty)');
+                setStatus('Ready.');
+                disableAll(false);
+              }).withFailureHandler((err) => {
+                setStatus('Error: ' + safeMsg_(err));
+                disableAll(false);
+              }).sendChatMessage(text, el('instructions').value);
+            };
+
+            if (el('autoSync') && el('autoSync').checked) {
+              setStatus('Auto-syncing document...');
+              google.script.run.withSuccessHandler(() => doSend())
+                .withFailureHandler((err) => {
+                  setStatus('Auto-sync failed: ' + safeMsg_(err));
+                  disableAll(false);
+                })
+                .syncDocumentToKnowledge(el('instructions').value);
+            } else {
+              doSend();
+            }
+          });
+
+          loadState();
+        } catch (err) {
+          setStatus('Init error: ' + safeMsg_(err));
+        }
+      }
+
+      init();
     </script>
   </body>
 </html>
