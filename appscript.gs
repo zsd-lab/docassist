@@ -8,14 +8,42 @@
  */
 
 function onOpen() {
-  DocumentApp.getUi().createMenu('GPT-5.2')
+  DocumentApp.getUi().createMenu('Assistant')
     .addItem('Open Chat Sidebar', 'showChatSidebar')
+    .addItem('Reset Doc Assist (this document)', 'resetDocAssistForThisDocument')
     .addSeparator()
     .addItem('Sync Document to Knowledge', 'syncDocumentToKnowledge')
     .addSeparator()
     .addItem('Process Selected Text (legacy)', 'processSelection')
     .addItem('Chat with Document (legacy)', 'chatWithDocument')
     .addToUi();
+}
+
+function resetDocAssistForThisDocument() {
+  const started = Date.now();
+  const ui = DocumentApp.getUi();
+
+  const result = ui.alert(
+    'Reset Doc Assist for this document?',
+    'This will delete the saved Project Instructions for this Google Doc (DOCASSIST_INSTRUCTIONS).\n\nIt will not change server-side session/history.',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (result !== ui.Button.YES) {
+    log_('doc.reset.cancel', { ms: Date.now() - started });
+    return;
+  }
+
+  const docProps = PropertiesService.getDocumentProperties();
+  docProps.deleteProperty('DOCASSIST_INSTRUCTIONS');
+
+  log_('doc.reset.ok', { ms: Date.now() - started });
+
+  ui.alert(
+    'Reset complete',
+    'Project Instructions cleared for this document. Open the sidebar to set new instructions.',
+    ui.ButtonSet.OK
+  );
 }
 
 // ====== MINIMAL SERVER-SIDE LOGGING ======
@@ -100,7 +128,7 @@ function sanitizeForLog_(value) {
 function showChatSidebar() {
   const html = HtmlService
     .createHtmlOutput(getChatSidebarHtml_())
-    .setTitle('GPT-5.2 Chat');
+    .setTitle('Assistant Chat');
   DocumentApp.getUi().showSidebar(html);
 }
 
@@ -145,7 +173,7 @@ function getChatSidebarHtml_() {
     </style>
   </head>
   <body>
-    <h2>GPT-5.2 Chat</h2>
+    <h2>Assistant Chat</h2>
 
     <div class="row">
       <details id="settings">
@@ -445,7 +473,7 @@ function getChatSidebarHtml_() {
         const doSend = () => {
           setStatus('Thinking...');
           google.script.run.withSuccessHandler((reply) => {
-            addMsg('GPT-5.2', reply || '(empty)');
+            addMsg('Assistant', reply || '(empty)');
             setStatus('Ready.');
             disableAll(false);
           }).withFailureHandler((err) => {
@@ -735,7 +763,7 @@ function processSelection() {
 
   // 3. Get instructions from user
   const response = ui.prompt(
-    'GPT-5.2 Instructions',
+    'Assistant Instructions',
     'Enter instruction (e.g. "Summarize", "Translate to Hungarian", "Improve style"):',
     ui.ButtonSet.OK_CANCEL
   );
@@ -757,7 +785,7 @@ function processSelection() {
     body.appendHorizontalRule();
     
     // Label paragraph
-    const labelPara = body.appendParagraph("GPT-5.2 Response:");
+    const labelPara = body.appendParagraph("Assistant Response:");
     
     // Use bold instead of heading (safer styling)
     try {
