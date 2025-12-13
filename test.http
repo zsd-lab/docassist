@@ -5,3 +5,37 @@ Content-Type: application/json
   "text": "Ez egy nagyon hosszú szöveg, amit szeretnék összefoglalni.",
   "instruction": "Foglaljad össze magyarul."
 }
+
+###
+# V2 (ChatGPT-like) examples
+# If you set DOCASSIST_TOKEN on the server, add:
+# Authorization: Bearer <token>
+
+### Init / ensure session
+POST http://localhost:3000/v2/init
+Content-Type: application/json
+
+{
+  "docId": "demo-doc-id",
+  "instructions": "You are my writing partner. Reply in Hungarian unless I ask English."
+}
+
+### Sync document into knowledge (vector store)
+POST http://localhost:3000/v2/sync-doc
+Content-Type: application/json
+
+{
+  "docId": "demo-doc-id",
+  "docTitle": "Demo Document",
+  "docText": "This is the current document content. It can be long.",
+  "instructions": "You are my writing partner."
+}
+
+### Chat (uses conversation state + file_search over vector store)
+POST http://localhost:3000/v2/chat
+Content-Type: application/json
+
+{
+  "docId": "demo-doc-id",
+  "userMessage": "Summarize the document in 5 bullet points."
+}

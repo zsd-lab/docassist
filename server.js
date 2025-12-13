@@ -1,8 +1,9 @@
 // server.js
 import "dotenv/config";
 import express from "express";
-import OpenAI from "openai";
+import OpenAI, { toFile } from "openai";
 import pkg from "pg";
+import crypto from "crypto";
 
 const { Pool } = pkg;
 
@@ -10,6 +11,21 @@ console.log("Starting doc-assist server...");
 
 const app = express();
 app.use(express.json());
+
+// ====== AUTH (optional) ======
+// If DOCASSIST_TOKEN is set, require: Authorization: Bearer <token>
+const DOCASSIST_TOKEN = process.env.DOCASSIST_TOKEN || "";
+app.use((req, res, next) => {
+  if (!DOCASSIST_TOKEN) return next();
+  if (req.method === "GET" && req.path === "/") return next();
+
+  const auth = String(req.headers.authorization || "");
+  const expected = `Bearer ${DOCASSIST_TOKEN}`;
+  if (auth !== expected) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  return next();
+});
 
 // ====== POSTGRES POOL ======
 const pool = new Pool({
@@ -22,6 +38,8 @@ const pool = new Pool({
 // ====== KONFIG ======
 const MAX_TURNS_PER_DOC = 25;        // max ennyi user+assistant turn/doksi
 const MAX_DOC_CHARS = 50000;         // doksi szöveg max hossza (chathez)
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.2";
 
 const SYSTEM_PROMPT = `
 You are ChatGPT working as David's writing, analysis, and thinking partner inside Google Docs.
@@ -46,6 +64,128 @@ app.get("/", (req, res) => {
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// ====== DB BOOTSTRAP (keep old chat_history + add v2 session tables) ======
+async function ensureTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_history (
+      id SERIAL PRIMARY KEY,
+      doc_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS docs_sessions (
+      doc_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      vector_store_id TEXT NOT NULL,
+      instructions TEXT,
+      model TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS docs_files (
+      id SERIAL PRIMARY KEY,
+      doc_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      vector_store_file_id TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+}
+
+function sha256Hex(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function buildInstructions(customInstructions) {
+  const custom = String(customInstructions || "").trim();
+  if (!custom) return SYSTEM_PROMPT;
+
+  return `${SYSTEM_PROMPT}\n\n---\nProject instructions (user-provided):\n${custom}`.trim();
+}
+
+async function getOrCreateSession(docId, maybeInstructions) {
+  const existing = await pool.query(
+    `SELECT doc_id, conversation_id, vector_store_id, instructions, model FROM docs_sessions WHERE doc_id = $1`,
+    [docId]
+  );
+
+  if (existing.rows.length > 0) {
+    const row = existing.rows[0];
+    const incoming = typeof maybeInstructions === "string" ? maybeInstructions : "";
+
+    if (incoming && incoming.trim() !== String(row.instructions || "").trim()) {
+      await pool.query(
+        `UPDATE docs_sessions SET instructions = $2, updated_at = NOW() WHERE doc_id = $1`,
+        [docId, incoming]
+      );
+      row.instructions = incoming;
+    }
+
+    if (!row.model) row.model = OPENAI_MODEL;
+    return row;
+  }
+
+  const conv = await client.conversations.create({
+    metadata: { doc_id: docId },
+  });
+
+  const vectorStore = await client.vectorStores.create({
+    name: `docassist-${docId}`,
+    metadata: { doc_id: docId },
+  });
+
+  const instructions = typeof maybeInstructions === "string" ? maybeInstructions : "";
+
+  await pool.query(
+    `
+      INSERT INTO docs_sessions (doc_id, conversation_id, vector_store_id, instructions, model)
+      VALUES ($1, $2, $3, $4, $5)
+    `,
+    [docId, conv.id, vectorStore.id, instructions, OPENAI_MODEL]
+  );
+
+  return {
+    doc_id: docId,
+    conversation_id: conv.id,
+    vector_store_id: vectorStore.id,
+    instructions,
+    model: OPENAI_MODEL,
+  };
+}
+
+async function recordVectorStoreFile(docId, kind, filename, sha256, vectorStoreFileId) {
+  await pool.query(
+    `
+      INSERT INTO docs_files (doc_id, kind, filename, sha256, vector_store_file_id)
+      VALUES ($1, $2, $3, $4, $5)
+    `,
+    [docId, kind, filename, sha256, vectorStoreFileId]
+  );
+}
+
+async function findExistingVectorStoreFile(docId, kind, sha256) {
+  const result = await pool.query(
+    `
+      SELECT vector_store_file_id
+      FROM docs_files
+      WHERE doc_id = $1 AND kind = $2 AND sha256 = $3
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `,
+    [docId, kind, sha256]
+  );
+  return result.rows[0]?.vector_store_file_id || null;
+}
 
 // ====== DB-ALAPÚ CHAT HISTORY STORE ======
 
@@ -121,7 +261,7 @@ async function appendToHistory(docId, role, content) {
  * ONE-SHOT: kiválasztott szöveg + instruction feldolgozása (Process Selected Text).
  */
 async function runDocsAgent(text, instruction) {
-  const model = "gpt-5.1";
+  const model = OPENAI_MODEL;
 
   const response = await client.chat.completions.create({
     model,
@@ -161,7 +301,7 @@ async function runDocsAgent(text, instruction) {
  * - userMessage: aktuális user kérdés/utasítás
  */
 async function runChatWithDoc(docId, docText, userMessage) {
-  const model = "gpt-5.1";
+  const model = OPENAI_MODEL;
 
   // Doksi vágása, hogy ne zabálja fel az egész kontextust
   const clippedDocText =
@@ -265,10 +405,149 @@ app.post("/chat-docs", async (req, res) => {
     res.status(500).json({
       error: err.message || "Internal server error",
     });
-  }0
+  }
+});
+
+// ====== V2 (ChatGPT-like): Responses + Conversations + Vector Store ======
+
+/**
+ * POST /v2/init
+ * body: { docId: string, instructions?: string }
+ * reply: { docId, conversationId, vectorStoreId, model }
+ */
+app.post("/v2/init", async (req, res) => {
+  try {
+    const { docId, instructions } = req.body || {};
+    if (!docId) {
+      return res.status(400).json({ error: "Missing 'docId'" });
+    }
+
+    const session = await getOrCreateSession(String(docId), typeof instructions === "string" ? instructions : "");
+    return res.json({
+      docId: session.doc_id,
+      conversationId: session.conversation_id,
+      vectorStoreId: session.vector_store_id,
+      model: session.model || OPENAI_MODEL,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+/**
+ * POST /v2/sync-doc
+ * body: { docId: string, docTitle?: string, docText: string, instructions?: string }
+ * reply: { vectorStoreFileId: string, reused: boolean }
+ */
+app.post("/v2/sync-doc", async (req, res) => {
+  try {
+    const { docId, docTitle, docText, instructions } = req.body || {};
+    if (!docId || typeof docText !== "string") {
+      return res.status(400).json({ error: "Missing 'docId' or 'docText'" });
+    }
+
+    const session = await getOrCreateSession(String(docId), typeof instructions === "string" ? instructions : "");
+
+    const title = String(docTitle || "document").replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const filename = `${title || "document"}_${String(docId).slice(0, 8)}.txt`;
+    const buf = Buffer.from(docText, "utf8");
+    const hash = sha256Hex(buf);
+
+    const existingVsf = await findExistingVectorStoreFile(String(docId), "doc", hash);
+    if (existingVsf) {
+      return res.json({ vectorStoreFileId: existingVsf, reused: true });
+    }
+
+    const uploadable = await toFile(buf, filename, { type: "text/plain" });
+    const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadable);
+
+    await recordVectorStoreFile(String(docId), "doc", filename, hash, vsFile.id);
+    return res.json({ vectorStoreFileId: vsFile.id, reused: false });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+/**
+ * POST /v2/upload-file
+ * body: { docId: string, filename: string, mimeType?: string, contentBase64: string, instructions?: string }
+ * reply: { vectorStoreFileId: string, reused: boolean }
+ */
+app.post("/v2/upload-file", async (req, res) => {
+  try {
+    const { docId, filename, mimeType, contentBase64, instructions } = req.body || {};
+    if (!docId || !filename || !contentBase64) {
+      return res.status(400).json({ error: "Missing 'docId', 'filename', or 'contentBase64'" });
+    }
+
+    const session = await getOrCreateSession(String(docId), typeof instructions === "string" ? instructions : "");
+
+    const buf = Buffer.from(String(contentBase64), "base64");
+    const hash = sha256Hex(buf);
+    const safeName = String(filename).replace(/[^a-zA-Z0-9._-]+/g, "_");
+
+    const existingVsf = await findExistingVectorStoreFile(String(docId), "upload", hash);
+    if (existingVsf) {
+      return res.json({ vectorStoreFileId: existingVsf, reused: true });
+    }
+
+    const uploadable = await toFile(buf, safeName, { type: String(mimeType || "application/octet-stream") });
+    const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadable);
+    await recordVectorStoreFile(String(docId), "upload", safeName, hash, vsFile.id);
+
+    return res.json({ vectorStoreFileId: vsFile.id, reused: false });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+/**
+ * POST /v2/chat
+ * body: { docId: string, userMessage: string, instructions?: string }
+ * reply: { reply: string, responseId: string }
+ */
+app.post("/v2/chat", async (req, res) => {
+  try {
+    const { docId, userMessage, instructions } = req.body || {};
+    if (!docId || !userMessage) {
+      return res.status(400).json({ error: "Missing 'docId' or 'userMessage'" });
+    }
+
+    const session = await getOrCreateSession(String(docId), typeof instructions === "string" ? instructions : "");
+
+    const response = await client.responses.create({
+      model: session.model || OPENAI_MODEL,
+      conversation: session.conversation_id,
+      instructions: buildInstructions(session.instructions),
+      tools: [
+        {
+          type: "file_search",
+          vector_store_ids: [session.vector_store_id],
+        },
+      ],
+      input: String(userMessage),
+      max_output_tokens: 1200,
+    });
+
+    return res.json({
+      reply: String(response.output_text || "").trim(),
+      responseId: response.id,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message || "Internal server error" });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
+await ensureTables();
+
 app.listen(PORT, () => {
   console.log(`Docs agent backend listening on port ${PORT}`);
+  console.log(`OpenAI model: ${OPENAI_MODEL}`);
+  if (DOCASSIST_TOKEN) console.log("Auth: enabled (DOCASSIST_TOKEN)");
+  else console.log("Auth: disabled (set DOCASSIST_TOKEN to enable)");
 });
