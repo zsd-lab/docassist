@@ -153,7 +153,9 @@ function getChatSidebarHtml_() {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: Arial, sans-serif; font-size: 13px; margin: 12px; height: 100vh; box-sizing: border-box; display: flex; flex-direction: column; }
+      html, body { background: #fff; }
+      html, body { height: 100%; }
+      body { font-family: Arial, sans-serif; font-size: 13px; margin: 0; padding: 12px; height: 100%; min-height: 0; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
       .row { margin-bottom: 10px; }
       label { display: block; font-weight: 600; margin-bottom: 4px; }
       input[type="text"], input[type="password"], textarea {
@@ -164,8 +166,9 @@ function getChatSidebarHtml_() {
       button.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
       button:disabled { opacity: 0.6; cursor: not-allowed; }
       .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-      .top-area { height: clamp(620px, calc(100vh - 220px), 950px); display: flex; flex-direction: column; }
-      .chat { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; flex: 1 1 auto; overflow: auto; background: #fafafa; min-height: 340px; }
+      .top-area { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+      .chat-row { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+      .chat { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; flex: 1 1 auto; min-height: 0; overflow: auto; background: #fafafa; overflow-wrap: anywhere; word-break: break-word; }
       #msg { min-height: 110px; max-height: 180px; }
       .msg { margin: 8px 0; }
       .role { font-weight: 700; margin-right: 6px; }
@@ -188,7 +191,7 @@ function getChatSidebarHtml_() {
   </head>
   <body>
     <div class="top-area">
-      <div class="row">
+      <div class="row chat-row">
         <label>Chat</label>
         <div id="chat" class="chat"></div>
       </div>
@@ -198,6 +201,7 @@ function getChatSidebarHtml_() {
         <textarea id="msg" placeholder="Ask something about the doc, or request edits..."></textarea>
         <div class="controls" style="margin-top:6px;">
           <button id="sendBtn" class="primary">Send</button>
+          <button id="copyLastBtn" title="Copy the most recent Assistant reply">Copy last reply</button>
         </div>
       </div>
     </div>
@@ -236,6 +240,14 @@ function getChatSidebarHtml_() {
         <summary>Connection settings</summary>
         <div class="details-body">
           <div class="row">
+            <label>Backend info</label>
+            <div id="backendInfo" class="small">Not loaded.</div>
+            <div class="controls" style="margin-top:6px;">
+              <button id="refreshInfoBtn">Refresh</button>
+            </div>
+          </div>
+
+          <div class="row">
             <label>Backend URL</label>
             <input id="baseUrl" type="text" placeholder="https://your-server.example.com" />
             <div class="small">Stored in Script Properties as <code>DOCASSIST_BASE_URL</code>.</div>
@@ -259,6 +271,7 @@ function getChatSidebarHtml_() {
     <script>
       const el = (id) => document.getElementById(id);
       const TICK = String.fromCharCode(96);
+      const chatHistory = [];
 
       function escapeHtml(s) {
         return String(s || '')
@@ -377,7 +390,68 @@ function getChatSidebarHtml_() {
         el('status').textContent = text || '';
       }
 
+      async function writeClipboardText_(text) {
+        const t = String(text || '');
+        if (!t) throw new Error('Nothing to copy.');
+
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(t);
+          return;
+        }
+
+        // Fallback for environments where Clipboard API is unavailable.
+        const ta = document.createElement('textarea');
+        ta.value = t;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.style.top = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand && document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (!ok) throw new Error('Copy failed (clipboard not available).');
+      }
+
+      function getLastCopyText_() {
+        for (let i = chatHistory.length - 1; i >= 0; i--) {
+          const msg = chatHistory[i];
+          if (!msg) continue;
+          const roleLower = String(msg.role || '').toLowerCase();
+          if (roleLower === 'assistant' || roleLower.includes('assistant') || roleLower.includes('gpt')) {
+            const t = String(msg.text || '').trim();
+            if (t) return t;
+          }
+        }
+        const last = chatHistory.length ? chatHistory[chatHistory.length - 1] : null;
+        return last ? String(last.text || '').trim() : '';
+      }
+
+      async function copyLastReply_() {
+        try {
+          const text = getLastCopyText_();
+          if (!text) {
+            setStatus('Nothing to copy yet.');
+            return;
+          }
+          await writeClipboardText_(text);
+          setStatus('Copied. Inserting into doc...');
+          google.script.run
+            .withSuccessHandler(() => {
+              setStatus('Copied and inserted into doc.');
+            })
+            .withFailureHandler((err) => {
+              setStatus('Copied, but insert failed: ' + (err && err.message ? err.message : err));
+            })
+            .insertTextIntoDocFromSidebar(text);
+        } catch (e) {
+          setStatus('Copy failed: ' + (e && e.message ? e.message : e));
+        }
+      }
+
       function addMsg(role, text) {
+        chatHistory.push({ role: String(role || ''), text: String(text || '') });
         const div = document.createElement('div');
         div.className = 'msg';
         const roleSpan = document.createElement('span');
@@ -401,8 +475,10 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn'].forEach(id => el(id).disabled = disabled);
+        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn'].forEach(id => el(id).disabled = disabled);
       }
+
+      el('copyLastBtn').addEventListener('click', () => copyLastReply_());
 
       function loadState() {
         setStatus('Loading settings...');
@@ -413,9 +489,39 @@ function getChatSidebarHtml_() {
           el('instructions').value = state.instructions || '';
           if (settingsEl) settingsEl.open = !state.baseUrl;
           setStatus(state.baseUrl ? 'Ready.' : 'Set Backend URL first (open Connection settings).');
+
+          if (state.baseUrl) refreshBackendInfo_();
         }).withFailureHandler((err) => {
           setStatus('Error loading state: ' + (err && err.message ? err.message : err));
         }).getSidebarState();
+      }
+
+      function refreshBackendInfo_() {
+        const infoEl = document.getElementById('backendInfo');
+        if (infoEl) infoEl.textContent = 'Loading...';
+
+        google.script.run
+          .withSuccessHandler((info) => {
+            try {
+              const cfg = (info && info.config) ? info.config : {};
+              const model = cfg.model || '';
+              const mot = (cfg.maxOutputTokens != null) ? String(cfg.maxOutputTokens) : '';
+              const bl = cfg.bodyLimit || '';
+              const rl = (cfg.rateLimit && cfg.rateLimit.enabled) ? 'on' : 'off';
+
+              const line = 'model=' + model +
+                ' | max_output_tokens=' + mot +
+                ' | body_limit=' + bl +
+                ' | rate_limit=' + rl;
+              if (infoEl) infoEl.textContent = line;
+            } catch (e) {
+              if (infoEl) infoEl.textContent = 'Loaded, but failed to render.';
+            }
+          })
+          .withFailureHandler((err) => {
+            if (infoEl) infoEl.textContent = 'Error: ' + (err && err.message ? err.message : err);
+          })
+          .getBackendInfo();
       }
 
       el('saveSettingsBtn').addEventListener('click', () => {
@@ -423,12 +529,15 @@ function getChatSidebarHtml_() {
         setStatus('Saving settings...');
         google.script.run.withSuccessHandler(() => {
           setStatus('Settings saved.');
+          refreshBackendInfo_();
           disableAll(false);
         }).withFailureHandler((err) => {
           setStatus('Error saving settings: ' + (err && err.message ? err.message : err));
           disableAll(false);
         }).saveSidebarSettings(el('baseUrl').value, el('token').value);
       });
+
+      el('refreshInfoBtn').addEventListener('click', () => refreshBackendInfo_());
 
       el('saveInstrBtn').addEventListener('click', () => {
         disableAll(true);
@@ -641,6 +750,66 @@ function callBackendV2_(path, payload) {
   return json;
 }
 
+function callBackendV2Get_(path) {
+  const started = Date.now();
+  const url = getBackendBaseUrl_() + path;
+  const token = getBackendToken_();
+
+  const headers = { Accept: 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  const options = {
+    method: 'get',
+    headers: headers,
+    muteHttpExceptions: true,
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  let json;
+  try {
+    json = responseText ? JSON.parse(responseText) : {};
+  } catch (err) {
+    log_('v2.call_get.invalid_json', {
+      path: path,
+      url: url,
+      responseCode: responseCode,
+      responseTextSample: String(responseText || '').slice(0, 300),
+      ms: Date.now() - started
+    });
+    throw new Error('Backend returned invalid JSON: ' + responseText);
+  }
+
+  if (responseCode < 200 || responseCode >= 300) {
+    const errorMsg = json && json.error ? json.error : responseText;
+
+    log_('v2.call_get.error', {
+      path: path,
+      url: url,
+      responseCode: responseCode,
+      error: errorMsg,
+      ms: Date.now() - started
+    });
+
+    throw new Error(errorMsg + ' (HTTP ' + responseCode + ')');
+  }
+
+  log_('v2.call_get.ok', {
+    path: path,
+    url: url,
+    responseCode: responseCode,
+    ms: Date.now() - started
+  });
+
+  return json;
+}
+
+function getBackendInfo() {
+  return callBackendV2Get_('/v2/info');
+}
+
 function ensureV2Session_(instructionsOverride) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
@@ -739,6 +908,43 @@ function sendChatMessage(userMessage, instructionsOverride) {
   });
 
   return String(resp.reply || '');
+}
+
+function insertTextIntoDocFromSidebar(text) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+  const t = String(text || '');
+
+  if (!t) {
+    throw new Error('Nothing to insert.');
+  }
+
+  const cursor = doc.getCursor();
+  if (cursor) {
+    const el = cursor.getElement();
+    const offset = cursor.getOffset();
+
+    // Most commonly the cursor is inside a Text element.
+    if (el && typeof el.editAsText === 'function') {
+      el.editAsText().insertText(offset, t);
+      log_('doc.insert_text.cursor_text', { len: t.length, ms: Date.now() - started });
+      return;
+    }
+
+    // Fallback: insert a new paragraph after the current element.
+    try {
+      const parent = el.getParent();
+      const idx = parent.getChildIndex(el);
+      parent.insertParagraph(idx + 1, t);
+      log_('doc.insert_text.cursor_paragraph', { len: t.length, ms: Date.now() - started });
+      return;
+    } catch (e) {
+      // Last-resort append below.
+    }
+  }
+
+  doc.getBody().appendParagraph(t);
+  log_('doc.insert_text.append', { len: t.length, ms: Date.now() - started });
 }
 
 /**
