@@ -873,6 +873,7 @@ function resetServerStateForThisDocument() {
 
   const resp = callBackendV2_('/v2/reset-doc', {
     docId: doc.getId(),
+    cleanupOpenAI: true,
   });
 
   log_('v2.reset_doc', {

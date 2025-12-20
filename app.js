@@ -598,8 +598,16 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       });
       if (!docId) return;
 
+      const cleanupOpenAI = (() => {
+        if (req.body.cleanupOpenAI == null) return cfg.resetCleanupOpenAI;
+        const v = req.body.cleanupOpenAI;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        return s === "1" || s === "true" || s === "yes" || s === "on";
+      })();
+
       // Optional best-effort OpenAI cleanup (off by default).
-      if (cfg.resetCleanupOpenAI) {
+      if (cleanupOpenAI) {
         try {
           const s = await pool.query(
             `SELECT conversation_id, vector_store_id FROM docs_sessions WHERE doc_id = $1`,
@@ -675,7 +683,7 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
           docsSessions: d3.rowCount ?? 0,
         },
         openaiCleanup: {
-          enabled: cfg.resetCleanupOpenAI,
+          enabled: cleanupOpenAI,
         },
       });
     } catch (err) {

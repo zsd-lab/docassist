@@ -238,3 +238,55 @@ test("POST /v2/reset-doc deletes DB state", async () => {
   assert.ok(res.headers["x-request-id"]);
   assert.ok(calls.length >= 3);
 });
+
+test("POST /v2/reset-doc cleanupOpenAI=true attempts OpenAI deletes (best-effort)", async () => {
+  const openaiCalls = [];
+  const openaiClient = {
+    vectorStores: {
+      files: {
+        del: async (vectorStoreId, fileId) => {
+          openaiCalls.push({ op: "vs.files.del", vectorStoreId, fileId });
+        },
+      },
+      del: async (vectorStoreId) => {
+        openaiCalls.push({ op: "vs.del", vectorStoreId });
+      },
+    },
+    conversations: {
+      del: async (conversationId) => {
+        openaiCalls.push({ op: "conv.del", conversationId });
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("SELECT conversation_id, vector_store_id")) {
+          return { rows: [{ conversation_id: "c1", vector_store_id: "vs1" }], rowCount: 1 };
+        }
+        if (q.includes("SELECT vector_store_file_id")) {
+          return { rows: [{ vector_store_file_id: "f1" }, { vector_store_file_id: "f2" }], rowCount: 2 };
+        }
+        if (q.includes("DELETE FROM chat_history")) return { rows: [], rowCount: 0 };
+        if (q.includes("DELETE FROM docs_files")) return { rows: [], rowCount: 2 };
+        if (q.includes("DELETE FROM docs_sessions")) return { rows: [], rowCount: 1 };
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", resetCleanupOpenAI: false },
+  });
+
+  const res = await request(app)
+    .post("/v2/reset-doc")
+    .send({ docId: "doc1", cleanupOpenAI: true });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.openaiCleanup.enabled, true);
+  assert.ok(openaiCalls.find((c) => c.op === "vs.files.del" && c.fileId === "f1"));
+  assert.ok(openaiCalls.find((c) => c.op === "vs.files.del" && c.fileId === "f2"));
+  assert.ok(openaiCalls.find((c) => c.op === "vs.del"));
+  assert.ok(openaiCalls.find((c) => c.op === "conv.del"));
+});
