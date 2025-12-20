@@ -12,6 +12,7 @@ function onOpen() {
     .addItem('Open Chat Sidebar', 'showChatSidebar')
     .addItem('Open Chat (wide window)', 'showChatDialog')
     .addItem('Reset Doc Assist (this document)', 'resetDocAssistForThisDocument')
+    .addItem('Reset Server State (this document)', 'resetServerStateForThisDocumentMenu')
     .addSeparator()
     .addItem('Sync Document to Knowledge', 'syncDocumentToKnowledge')
     .addSeparator()
@@ -45,6 +46,26 @@ function resetDocAssistForThisDocument() {
     'Project Instructions cleared for this document. Open the sidebar to set new instructions.',
     ui.ButtonSet.OK
   );
+}
+
+function resetServerStateForThisDocumentMenu() {
+  const started = Date.now();
+  const ui = DocumentApp.getUi();
+
+  const result = ui.alert(
+    'Reset server state for this document?',
+    'This will delete server-side session/history for this Google Doc (v2).\n\nIt will not delete your Google Doc content.',
+    ui.ButtonSet.YES_NO
+  );
+
+  if (result !== ui.Button.YES) {
+    log_('v2.reset_doc.cancel', { ms: Date.now() - started });
+    return;
+  }
+
+  const resp = resetServerStateForThisDocument();
+  log_('v2.reset_doc.menu', { ms: Date.now() - started, deleted: resp && resp.deleted ? resp.deleted : {} });
+  ui.alert('Reset complete', 'Server state reset for this document.', ui.ButtonSet.OK);
 }
 
 // ====== MINIMAL SERVER-SIDE LOGGING ======
@@ -262,6 +283,14 @@ function getChatSidebarHtml_() {
           <div class="row controls">
             <button id="saveSettingsBtn">Save Settings</button>
           </div>
+
+          <div class="row">
+            <label>Reset server state</label>
+            <div class="controls" style="margin-top:6px;">
+              <button id="resetServerBtn">Reset Server State</button>
+            </div>
+            <div class="small">Deletes server-side v2 session/history for this doc.</div>
+          </div>
         </div>
       </details>
     </div>
@@ -475,7 +504,7 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn'].forEach(id => el(id).disabled = disabled);
+        ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn'].forEach(id => el(id).disabled = disabled);
       }
 
       el('copyLastBtn').addEventListener('click', () => copyLastReply_());
@@ -538,6 +567,34 @@ function getChatSidebarHtml_() {
       });
 
       el('refreshInfoBtn').addEventListener('click', () => refreshBackendInfo_());
+
+      function resetServerState_() {
+        const ok = window.confirm('Reset server state for this document? This deletes server-side session/history.');
+        if (!ok) return;
+
+        disableAll(true);
+        setStatus('Resetting server state...');
+
+        google.script.run
+          .withSuccessHandler(() => {
+            // Clear local UI history too (best-effort).
+            try {
+              chatHistory.length = 0;
+              const chatEl = el('chat');
+              if (chatEl) chatEl.innerHTML = '';
+            } catch (e) {}
+
+            setStatus('Server state reset.');
+            disableAll(false);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Reset failed: ' + (err && err.message ? err.message : err));
+            disableAll(false);
+          })
+          .resetServerStateForThisDocument();
+      }
+
+      el('resetServerBtn').addEventListener('click', () => resetServerState_());
 
       el('saveInstrBtn').addEventListener('click', () => {
         disableAll(true);
@@ -808,6 +865,23 @@ function callBackendV2Get_(path) {
 
 function getBackendInfo() {
   return callBackendV2Get_('/v2/info');
+}
+
+function resetServerStateForThisDocument() {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+
+  const resp = callBackendV2_('/v2/reset-doc', {
+    docId: doc.getId(),
+  });
+
+  log_('v2.reset_doc', {
+    docId: doc.getId(),
+    deleted: resp && resp.deleted ? resp.deleted : {},
+    ms: Date.now() - started,
+  });
+
+  return resp;
 }
 
 function ensureV2Session_(instructionsOverride) {

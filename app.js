@@ -19,6 +19,12 @@ export function createApp({
   const cfg = {
     bodyLimit: config?.bodyLimit || process.env.DOCASSIST_BODY_LIMIT || "25mb",
     token: config?.token ?? process.env.DOCASSIST_TOKEN ?? "",
+    resetCleanupOpenAI: (() => {
+      const raw = config?.resetCleanupOpenAI ?? process.env.DOCASSIST_RESET_CLEANUP_OPENAI;
+      if (raw == null) return false;
+      const s = String(raw).trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes" || s === "on";
+    })(),
     maxTurnsPerDoc: config?.maxTurnsPerDoc ?? 25,
     maxDocChars: config?.maxDocChars ?? 50000,
     maxDocIdChars: config?.maxDocIdChars ?? 256,
@@ -577,6 +583,105 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         },
       },
     });
+  });
+
+  // ====== V2 RESET DOC ======
+  // Deletes server-side session + history for a doc.
+  app.post("/v2/reset-doc", async (req, res) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const docId = requireString(req, res, "docId", req.body.docId, {
+        maxChars: cfg.maxDocIdChars,
+      });
+      if (!docId) return;
+
+      // Optional best-effort OpenAI cleanup (off by default).
+      if (cfg.resetCleanupOpenAI) {
+        try {
+          const s = await pool.query(
+            `SELECT conversation_id, vector_store_id FROM docs_sessions WHERE doc_id = $1`,
+            [docId]
+          );
+          const row = s.rows?.[0];
+
+          const f = await pool.query(
+            `SELECT vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
+            [docId]
+          );
+          const fileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
+
+          const conversationId = row?.conversation_id;
+          const vectorStoreId = row?.vector_store_id;
+
+          // Try deleting vector store files first.
+          if (vectorStoreId && client?.vectorStores?.files) {
+            for (const fileId of fileIds) {
+              try {
+                const filesApi = client.vectorStores.files;
+                if (typeof filesApi.del === "function") {
+                  await filesApi.del(vectorStoreId, fileId);
+                } else if (typeof filesApi.delete === "function") {
+                  await filesApi.delete(vectorStoreId, fileId);
+                }
+              } catch (_) {
+                // best-effort
+              }
+            }
+          }
+
+          // Delete vector store container.
+          if (vectorStoreId && client?.vectorStores) {
+            try {
+              if (typeof client.vectorStores.del === "function") {
+                await client.vectorStores.del(vectorStoreId);
+              } else if (typeof client.vectorStores.delete === "function") {
+                await client.vectorStores.delete(vectorStoreId);
+              }
+            } catch (_) {
+              // best-effort
+            }
+          }
+
+          // Delete conversation.
+          if (conversationId && client?.conversations) {
+            try {
+              if (typeof client.conversations.del === "function") {
+                await client.conversations.del(conversationId);
+              } else if (typeof client.conversations.delete === "function") {
+                await client.conversations.delete(conversationId);
+              }
+            } catch (_) {
+              // best-effort
+            }
+          }
+        } catch (_) {
+          // best-effort
+        }
+      }
+
+      const d1 = await pool.query(`DELETE FROM chat_history WHERE doc_id = $1`, [docId]);
+      const d2 = await pool.query(`DELETE FROM docs_files WHERE doc_id = $1`, [docId]);
+      const d3 = await pool.query(`DELETE FROM docs_sessions WHERE doc_id = $1`, [docId]);
+
+      return res.json({
+        ok: true,
+        docId,
+        deleted: {
+          chatHistory: d1.rowCount ?? 0,
+          docsFiles: d2.rowCount ?? 0,
+          docsSessions: d3.rowCount ?? 0,
+        },
+        openaiCleanup: {
+          enabled: cfg.resetCleanupOpenAI,
+        },
+      });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
   });
 
   // ====== ENDPOINTOK ======

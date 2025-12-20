@@ -3,9 +3,14 @@ import assert from "node:assert/strict";
 import request from "supertest";
 import { createApp } from "../app.js";
 
-function makePoolMock({ sessionRow } = {}) {
+function makePoolMock({ sessionRow, queryHandler } = {}) {
   return {
     async query(sql, params) {
+      if (typeof queryHandler === "function") {
+        const handled = await queryHandler(sql, params);
+        if (handled) return handled;
+      }
+
       const q = String(sql);
 
       if (q.includes("SELECT doc_id, conversation_id")) {
@@ -190,4 +195,46 @@ test("GET /v2/info returns config", async () => {
   assert.equal(res.body.config.rateLimit.windowMs, 1234);
   assert.equal(res.body.config.rateLimit.max, 5);
   assert.ok(res.headers["x-request-id"]);
+});
+
+test("POST /v2/reset-doc missing docId -> 400", async () => {
+  const { app } = createApp({
+    pool: makePoolMock(),
+    openaiClient: {},
+    config: { bodyLimit: "10kb", token: "" },
+  });
+
+  const res = await request(app).post("/v2/reset-doc").send({});
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, "Missing 'docId'");
+});
+
+test("POST /v2/reset-doc deletes DB state", async () => {
+  const calls = [];
+  const { app } = createApp({
+    pool: makePoolMock({
+      queryHandler: async (sql, params) => {
+        calls.push({ sql: String(sql), params });
+        const q = String(sql);
+        if (q.includes("DELETE FROM chat_history")) return { rows: [], rowCount: 7 };
+        if (q.includes("DELETE FROM docs_files")) return { rows: [], rowCount: 2 };
+        if (q.includes("DELETE FROM docs_sessions")) return { rows: [], rowCount: 1 };
+        return null;
+      },
+    }),
+    openaiClient: {},
+    config: { bodyLimit: "10kb", token: "" },
+  });
+
+  const res = await request(app).post("/v2/reset-doc").send({ docId: "doc1" });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.docId, "doc1");
+  assert.deepEqual(res.body.deleted, {
+    chatHistory: 7,
+    docsFiles: 2,
+    docsSessions: 1,
+  });
+  assert.ok(res.headers["x-request-id"]);
+  assert.ok(calls.length >= 3);
 });
