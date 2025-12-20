@@ -1211,8 +1211,17 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       const msgStr = String(userMessage || "");
       const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
       if (askedModel) {
+        const replyText = `A backend szerint ezzel a modellel hívlak: ${session.model || cfg.openaiModel}`;
+
+        try {
+          await appendToHistory(String(docId), "user", msgStr);
+          await appendToHistory(String(docId), "assistant", replyText);
+        } catch (e) {
+          logger.error(e);
+        }
+
         return res.json({
-          reply: `A backend szerint ezzel a modellel hívlak: ${session.model || cfg.openaiModel}`,
+          reply: replyText,
           responseId: "local-model-info",
         });
       }
@@ -1231,8 +1240,17 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         max_output_tokens: cfg.maxOutputTokens,
       });
 
+      const replyText = String(response.output_text || "").trim();
+
+      try {
+        await appendToHistory(String(docId), "user", msgStr);
+        await appendToHistory(String(docId), "assistant", replyText);
+      } catch (e) {
+        logger.error(e);
+      }
+
       return res.json({
-        reply: String(response.output_text || "").trim(),
+        reply: replyText,
         responseId: response.id,
       });
     } catch (err) {

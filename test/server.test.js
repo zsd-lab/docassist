@@ -13,6 +13,18 @@ function makePoolMock({ sessionRow, queryHandler } = {}) {
 
       const q = String(sql);
 
+      if (q.includes("INSERT INTO chat_history")) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
+        return { rows: [{ cnt: "0" }], rowCount: 1 };
+      }
+
+      if (q.includes("DELETE FROM chat_history") && q.includes("WHERE id IN")) {
+        return { rows: [], rowCount: 0 };
+      }
+
       if (q.includes("SELECT doc_id, conversation_id")) {
         return { rows: sessionRow ? [sessionRow] : [] };
       }
@@ -80,6 +92,7 @@ test("POST /v2/chat missing fields -> 400", async () => {
 });
 
 test("POST /v2/chat asked model -> local response without OpenAI call", async () => {
+  const inserts = [];
   const { app } = createApp({
     pool: makePoolMock({
       sessionRow: {
@@ -88,6 +101,17 @@ test("POST /v2/chat asked model -> local response without OpenAI call", async ()
         vector_store_id: "vs1",
         instructions: "",
         model: "test-model",
+      },
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("INSERT INTO chat_history")) {
+          inserts.push(params);
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
+          return { rows: [{ cnt: "0" }], rowCount: 1 };
+        }
+        return null;
       },
     }),
     openaiClient: {},
@@ -101,6 +125,62 @@ test("POST /v2/chat asked model -> local response without OpenAI call", async ()
   assert.equal(res.status, 200);
   assert.equal(res.body.responseId, "local-model-info");
   assert.match(res.body.reply, /test-model/);
+
+  assert.equal(inserts.length, 2);
+  assert.deepEqual(inserts[0], ["doc1", "user", "which model are you using?"]);
+  assert.equal(inserts[1][0], "doc1");
+  assert.equal(inserts[1][1], "assistant");
+  assert.match(String(inserts[1][2]), /test-model/);
+});
+
+test("POST /v2/chat persists user+assistant turns (OpenAI path)", async () => {
+  const calls = [];
+
+  const openaiClient = {
+    responses: {
+      async create() {
+        return { id: "r1", output_text: "Hello from OpenAI" };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      sessionRow: {
+        doc_id: "doc1",
+        conversation_id: "c1",
+        vector_store_id: "vs1",
+        instructions: "",
+        model: "test-model",
+      },
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("INSERT INTO chat_history")) {
+          calls.push({ type: "insert", params });
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
+          return { rows: [{ cnt: "0" }], rowCount: 1 };
+        }
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chat")
+    .send({ docId: "doc1", userMessage: "hi" });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.responseId, "r1");
+  assert.equal(res.body.reply, "Hello from OpenAI");
+
+  const inserts = calls.filter((c) => c.type === "insert").map((c) => c.params);
+  assert.equal(inserts.length, 2);
+  assert.deepEqual(inserts[0], ["doc1", "user", "hi"]);
+  assert.deepEqual(inserts[1], ["doc1", "assistant", "Hello from OpenAI"]);
 });
 
 test("Oversized body returns JSON 413", async () => {
