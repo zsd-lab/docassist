@@ -223,6 +223,7 @@ function getChatSidebarHtml_() {
         <div class="controls" style="margin-top:6px;">
           <button id="sendBtn" class="primary">Send</button>
           <button id="copyLastBtn" title="Copy the most recent Assistant reply">Copy last reply</button>
+          <button id="insertMdBtn" title="Insert the most recent Assistant reply with basic Markdown formatting">Insert last reply (Markdown)</button>
         </div>
       </div>
     </div>
@@ -232,6 +233,10 @@ function getChatSidebarHtml_() {
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="autoSync" type="checkbox" />
         Auto-sync before sending
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
+        <input id="replaceKnowledge" type="checkbox" />
+        Replace previous knowledge
       </label>
     </div>
 
@@ -504,10 +509,39 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn'].forEach(id => el(id).disabled = disabled);
+        ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn'].forEach(id => el(id).disabled = disabled);
       }
 
       el('copyLastBtn').addEventListener('click', () => copyLastReply_());
+
+      function insertLastReplyMarkdown_() {
+        try {
+          const text = getLastCopyText_();
+          if (!text) {
+            setStatus('Nothing to insert yet.');
+            return;
+          }
+
+          disableAll(true);
+          setStatus('Inserting formatted reply into doc...');
+
+          google.script.run
+            .withSuccessHandler(() => {
+              setStatus('Inserted formatted reply into doc.');
+              disableAll(false);
+            })
+            .withFailureHandler((err) => {
+              setStatus('Insert failed: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+            })
+            .insertMarkdownIntoDocFromSidebar(text);
+        } catch (e) {
+          setStatus('Insert failed: ' + (e && e.message ? e.message : e));
+          try { disableAll(false); } catch (err) {}
+        }
+      }
+
+      el('insertMdBtn').addEventListener('click', () => insertLastReplyMarkdown_());
 
       function loadState() {
         setStatus('Loading settings...');
@@ -617,7 +651,7 @@ function getChatSidebarHtml_() {
         }).withFailureHandler((err) => {
           setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
           disableAll(false);
-        }).syncDocumentToKnowledge(el('instructions').value);
+        }).syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
       });
 
       el('uploadBtn').addEventListener('click', async () => {
@@ -646,7 +680,7 @@ function getChatSidebarHtml_() {
         }).withFailureHandler((err) => {
           setStatus('Error uploading: ' + (err && err.message ? err.message : err));
           disableAll(false);
-        }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value);
+        }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
       });
 
       el('sendBtn').addEventListener('click', () => {
@@ -675,7 +709,7 @@ function getChatSidebarHtml_() {
               setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
               disableAll(false);
             })
-            .syncDocumentToKnowledge(el('instructions').value);
+            .syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
         } else {
           doSend();
         }
@@ -904,7 +938,7 @@ function ensureV2Session_(instructionsOverride) {
   return result;
 }
 
-function syncDocumentToKnowledge(instructionsOverride) {
+function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const docText = doc.getBody().getText();
@@ -920,7 +954,8 @@ function syncDocumentToKnowledge(instructionsOverride) {
     docId: doc.getId(),
     docTitle: doc.getName(),
     docText: docText,
-    instructions: instructions
+    instructions: instructions,
+    replaceKnowledge: Boolean(replaceKnowledge)
   });
 
   log_('v2.sync_doc', {
@@ -928,6 +963,7 @@ function syncDocumentToKnowledge(instructionsOverride) {
     docTitle: doc.getName(),
     docTextLen: String(docText || '').length,
     instructionsLen: String(instructions || '').length,
+    replaceKnowledge: Boolean(replaceKnowledge),
     reused: Boolean(resp && resp.reused),
     ms: Date.now() - started
   });
@@ -935,7 +971,7 @@ function syncDocumentToKnowledge(instructionsOverride) {
   return resp;
 }
 
-function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOverride) {
+function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOverride, replaceKnowledge) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
@@ -946,7 +982,8 @@ function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOv
     filename: filename,
     mimeType: mimeType,
     contentBase64: contentBase64,
-    instructions: instructions
+    instructions: instructions,
+    replaceKnowledge: Boolean(replaceKnowledge)
   });
 
   log_('v2.upload_file', {
@@ -955,6 +992,7 @@ function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOv
     mimeType: mimeType,
     base64Len: String(contentBase64 || '').length,
     instructionsLen: String(instructions || '').length,
+    replaceKnowledge: Boolean(replaceKnowledge),
     reused: Boolean(resp && resp.reused),
     ms: Date.now() - started
   });
@@ -1020,6 +1058,257 @@ function insertTextIntoDocFromSidebar(text) {
 
   doc.getBody().appendParagraph(t);
   log_('doc.insert_text.append', { len: t.length, ms: Date.now() - started });
+}
+
+function insertMarkdownIntoDocFromSidebar(markdown) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+  const md = normalizeNewlines_(String(markdown || ''));
+
+  if (!md || !md.trim()) {
+    throw new Error('Nothing to insert.');
+  }
+
+  let container = doc.getBody();
+  let insertAt = container.getNumChildren();
+
+  const cursor = doc.getCursor();
+  if (cursor) {
+    try {
+      const el = cursor.getElement();
+      const para = findClosestBlockElement_(el);
+      if (para) {
+        const p = para.getParent();
+        if (p && typeof p.getChildIndex === 'function') {
+          container = p;
+          insertAt = p.getChildIndex(para) + 1;
+        }
+      }
+    } catch (e) {
+      // Fallback: append to body.
+    }
+  }
+
+  const insertedCount = insertMarkdownIntoContainer_(container, insertAt, md);
+  log_('doc.insert_markdown', { chars: md.length, insertedCount: insertedCount, ms: Date.now() - started });
+}
+
+function normalizeNewlines_(s) {
+  return String(s || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function findClosestBlockElement_(el) {
+  let cur = el;
+  for (let i = 0; i < 30 && cur; i++) {
+    try {
+      const t = cur.getType && cur.getType();
+      if (t === DocumentApp.ElementType.PARAGRAPH || t === DocumentApp.ElementType.LIST_ITEM) {
+        return cur;
+      }
+      cur = cur.getParent && cur.getParent();
+    } catch (e) {
+      return null;
+    }
+  }
+  return null;
+}
+
+function insertMarkdownIntoContainer_(container, insertAt, md) {
+  const lines = normalizeNewlines_(md).split('\n');
+  let idx = insertAt;
+  let inserted = 0;
+  let inCodeBlock = false;
+
+  const canInsertListItem = container && typeof container.insertListItem === 'function';
+  const canInsertParagraph = container && typeof container.insertParagraph === 'function';
+  if (!canInsertParagraph) {
+    // Safety fallback.
+    container = DocumentApp.getActiveDocument().getBody();
+    idx = container.getNumChildren();
+  }
+
+  const insertParagraph_ = (text) => {
+    const p = container.insertParagraph(idx, String(text || ''));
+    idx += 1;
+    inserted += 1;
+    return p;
+  };
+
+  const insertListItem_ = (text, glyphType) => {
+    if (!canInsertListItem) {
+      return insertParagraph_(String(text || ''));
+    }
+    const li = container.insertListItem(idx, String(text || ''));
+    try {
+      if (glyphType) li.setGlyphType(glyphType);
+    } catch (e) {}
+    idx += 1;
+    inserted += 1;
+    return li;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = String(lines[i] || '');
+    const line = rawLine;
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+
+    if (inCodeBlock) {
+      const p = insertParagraph_(line);
+      try {
+        const t = p.editAsText();
+        t.setAttributes({
+          [DocumentApp.Attribute.FONT_FAMILY]: 'Courier New',
+        });
+      } catch (e) {}
+      continue;
+    }
+
+    if (!trimmed) {
+      insertParagraph_('');
+      continue;
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const text = headingMatch[2];
+      const p = insertParagraph_(stripInlineMdMarkers_(text));
+      try {
+        const map = {
+          1: DocumentApp.ParagraphHeading.HEADING1,
+          2: DocumentApp.ParagraphHeading.HEADING2,
+          3: DocumentApp.ParagraphHeading.HEADING3,
+          4: DocumentApp.ParagraphHeading.HEADING4,
+          5: DocumentApp.ParagraphHeading.HEADING5,
+          6: DocumentApp.ParagraphHeading.HEADING6,
+        };
+        p.setHeading(map[level] || DocumentApp.ParagraphHeading.NORMAL);
+      } catch (e) {}
+      continue;
+    }
+
+    const ulMatch = /^\s*[-*+]\s+(.+)$/.exec(line);
+    if (ulMatch) {
+      const text = stripInlineMdMarkers_(ulMatch[1]);
+      const li = insertListItem_(text, DocumentApp.GlyphType.BULLET);
+      applyInlineMarkdownFormatting_(li, ulMatch[1]);
+      continue;
+    }
+
+    const olMatch = /^\s*\d+\.\s+(.+)$/.exec(line);
+    if (olMatch) {
+      const text = stripInlineMdMarkers_(olMatch[1]);
+      const li = insertListItem_(text, DocumentApp.GlyphType.NUMBER);
+      applyInlineMarkdownFormatting_(li, olMatch[1]);
+      continue;
+    }
+
+    const p = insertParagraph_(stripInlineMdMarkers_(line));
+    applyInlineMarkdownFormatting_(p, line);
+  }
+
+  return inserted;
+}
+
+function stripInlineMdMarkers_(s) {
+  // Minimal marker stripping used to set paragraph text before applying attributes.
+  // Keeps the underlying text content while dropping **, *, and ` markers.
+  return String(s || '').replace(/\*\*/g, '').replace(/\*/g, '').replace(/`/g, '');
+}
+
+function applyInlineMarkdownFormatting_(paragraphOrListItem, originalLine) {
+  try {
+    const parsed = parseInlineMarkdownRuns_(String(originalLine || ''));
+    const t = paragraphOrListItem.editAsText();
+    t.setText(parsed.text);
+    for (let i = 0; i < parsed.runs.length; i++) {
+      const run = parsed.runs[i];
+      if (!run || run.start >= run.end) continue;
+
+      const attrs = {};
+      if (run.bold) attrs[DocumentApp.Attribute.BOLD] = true;
+      if (run.italic) attrs[DocumentApp.Attribute.ITALIC] = true;
+      if (run.code) attrs[DocumentApp.Attribute.FONT_FAMILY] = 'Courier New';
+      if (Object.keys(attrs).length === 0) continue;
+
+      t.setAttributes(run.start, run.end - 1, attrs);
+    }
+  } catch (e) {
+    // Best-effort: if formatting fails, keep inserted plain text.
+  }
+}
+
+function parseInlineMarkdownRuns_(line) {
+  const s = String(line || '');
+  let out = '';
+  let bold = false;
+  let italic = false;
+  let code = false;
+
+  const runs = [];
+  let runStart = 0;
+  let runBold = false;
+  let runItalic = false;
+  let runCode = false;
+
+  const startRun_ = () => {
+    runStart = out.length;
+    runBold = bold;
+    runItalic = italic;
+    runCode = code;
+  };
+
+  const endRun_ = () => {
+    const end = out.length;
+    if (end > runStart) {
+      runs.push({ start: runStart, end: end, bold: runBold, italic: runItalic, code: runCode });
+    }
+    runStart = end;
+    runBold = bold;
+    runItalic = italic;
+    runCode = code;
+  };
+
+  startRun_();
+
+  for (let i = 0; i < s.length; ) {
+    const ch = s[i];
+
+    if (ch === '`') {
+      endRun_();
+      code = !code;
+      startRun_();
+      i += 1;
+      continue;
+    }
+
+    if (!code && s.slice(i, i + 2) === '**') {
+      endRun_();
+      bold = !bold;
+      startRun_();
+      i += 2;
+      continue;
+    }
+
+    if (!code && ch === '*') {
+      endRun_();
+      italic = !italic;
+      startRun_();
+      i += 1;
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  endRun_();
+  return { text: out, runs: runs };
 }
 
 /**

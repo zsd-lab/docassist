@@ -8,6 +8,27 @@ const { Pool } = pkg;
 
 console.log("Starting doc-assist server...");
 
+const parseBool = (value, defaultValue) => {
+  if (value == null || value === "") return defaultValue;
+  const s = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return defaultValue;
+};
+
+const isProd = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+const requireToken = parseBool(process.env.DOCASSIST_REQUIRE_TOKEN, isProd);
+
+if (isProd && !process.env.OPENAI_API_KEY) {
+  throw new Error("Missing OPENAI_API_KEY (required in production)");
+}
+
+if (isProd && requireToken && !process.env.DOCASSIST_TOKEN) {
+  throw new Error(
+    "Missing DOCASSIST_TOKEN (required in production when DOCASSIST_REQUIRE_TOKEN is enabled)"
+  );
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {

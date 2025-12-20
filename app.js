@@ -350,6 +350,35 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+
+    // ----- Indexes & constraints (idempotent) -----
+    // 1) Dedupe any legacy duplicates before adding unique index.
+    await pool.query(`
+      WITH ranked AS (
+        SELECT
+          id,
+          ROW_NUMBER() OVER (
+            PARTITION BY doc_id, kind, sha256
+            ORDER BY created_at DESC, id DESC
+          ) AS rn
+        FROM docs_files
+      )
+      DELETE FROM docs_files
+      WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+    `);
+
+    // 2) Prevent duplicates going forward.
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS docs_files_doc_id_kind_sha256_uidx ON docs_files (doc_id, kind, sha256);`
+    );
+
+    // 3) Query performance.
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS docs_files_doc_id_idx ON docs_files (doc_id);`
+    );
+    await pool.query(
+      `CREATE INDEX IF NOT EXISTS chat_history_doc_id_created_at_idx ON chat_history (doc_id, created_at);`
+    );
   }
 
   async function recordVectorStoreFile(docId, kind, filename, sha256, vectorStoreFileId) {
@@ -357,6 +386,7 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       `
         INSERT INTO docs_files (doc_id, kind, filename, sha256, vector_store_file_id)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (doc_id, kind, sha256) DO NOTHING
       `,
       [docId, kind, filename, sha256, vectorStoreFileId]
     );
@@ -376,60 +406,223 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
     return result.rows?.[0]?.vector_store_file_id || null;
   }
 
-  async function getOrCreateSession(docId, maybeInstructions) {
-    const existing = await pool.query(
-      `SELECT doc_id, conversation_id, vector_store_id, instructions, model FROM docs_sessions WHERE doc_id = $1`,
+  async function bestEffortDeleteOpenAIResources_({ conversationId, vectorStoreId }) {
+    try {
+      if (vectorStoreId && client?.vectorStores) {
+        const vsApi = client.vectorStores;
+        if (typeof vsApi.del === "function") {
+          await vsApi.del(vectorStoreId);
+        } else if (typeof vsApi.delete === "function") {
+          await vsApi.delete(vectorStoreId);
+        }
+      }
+    } catch (_) {
+      // best-effort
+    }
+
+    try {
+      if (conversationId && client?.conversations) {
+        const cApi = client.conversations;
+        if (typeof cApi.del === "function") {
+          await cApi.del(conversationId);
+        } else if (typeof cApi.delete === "function") {
+          await cApi.delete(conversationId);
+        }
+      }
+    } catch (_) {
+      // best-effort
+    }
+  }
+
+  async function bestEffortDeleteVectorStoreFilesByIds_({ vectorStoreId, fileIds }) {
+    const ids = Array.isArray(fileIds) ? fileIds.filter(Boolean) : [];
+    if (!vectorStoreId || !ids.length) return { attempted: 0, deleted: 0, failed: 0, deletedIds: [] };
+
+    let deleted = 0;
+    let failed = 0;
+    const deletedIds = [];
+
+    for (const fileId of ids) {
+      try {
+        const filesApi = client?.vectorStores?.files;
+        if (!filesApi) {
+          failed++;
+          continue;
+        }
+
+        if (typeof filesApi.del === "function") {
+          await filesApi.del(vectorStoreId, fileId);
+        } else if (typeof filesApi.delete === "function") {
+          await filesApi.delete(vectorStoreId, fileId);
+        } else {
+          failed++;
+          continue;
+        }
+
+        deleted++;
+        deletedIds.push(fileId);
+      } catch (_) {
+        failed++;
+      }
+    }
+
+    return { attempted: ids.length, deleted, failed, deletedIds };
+  }
+
+  async function bestEffortReplaceKnowledgeForDoc_({ docId, vectorStoreId }) {
+    // Delete prior vector store files we know about for this doc, then delete corresponding rows.
+    // Note: if older files exist in the vector store but aren't present in docs_files, we can't remove them here.
+    const f = await pool.query(
+      `SELECT vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
       [docId]
     );
+    const fileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
 
-    if (existing.rows.length > 0) {
+    const delRes = await bestEffortDeleteVectorStoreFilesByIds_({ vectorStoreId, fileIds });
+
+    if (delRes.deletedIds.length) {
+      await pool.query(
+        `DELETE FROM docs_files WHERE doc_id = $1 AND vector_store_file_id = ANY($2::text[])`,
+        [docId, delRes.deletedIds]
+      );
+    }
+
+    return delRes;
+  }
+
+  async function getOrCreateSession(docId, maybeInstructions) {
+    const incoming = typeof maybeInstructions === "string" ? maybeInstructions : "";
+
+    const fetchAndMaybeUpdate_ = async (db) => {
+      const existing = await db.query(
+        `SELECT doc_id, conversation_id, vector_store_id, instructions, model FROM docs_sessions WHERE doc_id = $1`,
+        [docId]
+      );
+
+      if (existing.rows.length === 0) return null;
+
       const row = existing.rows[0];
-      const incoming = typeof maybeInstructions === "string" ? maybeInstructions : "";
 
       if (incoming && incoming.trim() !== String(row.instructions || "").trim()) {
-        await pool.query(
-          `UPDATE docs_sessions SET instructions = $2, updated_at = NOW() WHERE doc_id = $1`,
-          [docId, incoming]
-        );
+        await db.query(`UPDATE docs_sessions SET instructions = $2, updated_at = NOW() WHERE doc_id = $1`, [
+          docId,
+          incoming,
+        ]);
         row.instructions = incoming;
       }
 
       if (!row.model || row.model !== cfg.openaiModel) {
-        await pool.query(
-          `UPDATE docs_sessions SET model = $2, updated_at = NOW() WHERE doc_id = $1`,
-          [docId, cfg.openaiModel]
-        );
+        await db.query(`UPDATE docs_sessions SET model = $2, updated_at = NOW() WHERE doc_id = $1`, [
+          docId,
+          cfg.openaiModel,
+        ]);
         row.model = cfg.openaiModel;
       }
+
       return row;
+    };
+
+    // Fast path (no lock): if it exists, return quickly.
+    const fast = await fetchAndMaybeUpdate_(pool);
+    if (fast) return fast;
+
+    // Create path: serialize by docId via an advisory lock inside a transaction.
+    // This avoids two concurrent calls creating duplicate OpenAI resources.
+    if (typeof pool.connect !== "function") {
+      // Fallback (tests/mocks): keep behavior, but still cleanup on failure.
+      let conversationId;
+      let vectorStoreId;
+      try {
+        const conv = await client.conversations.create({ metadata: { doc_id: docId } });
+        conversationId = conv?.id;
+        const vectorStore = await client.vectorStores.create({
+          name: `docassist-${docId}`,
+          metadata: { doc_id: docId },
+        });
+        vectorStoreId = vectorStore?.id;
+
+        await pool.query(
+          `INSERT INTO docs_sessions (doc_id, conversation_id, vector_store_id, instructions, model)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [docId, conversationId, vectorStoreId, incoming, cfg.openaiModel]
+        );
+
+        return {
+          doc_id: docId,
+          conversation_id: conversationId,
+          vector_store_id: vectorStoreId,
+          instructions: incoming,
+          model: cfg.openaiModel,
+        };
+      } catch (err) {
+        await bestEffortDeleteOpenAIResources_({ conversationId, vectorStoreId });
+        throw err;
+      }
     }
 
-    const conv = await client.conversations.create({
-      metadata: { doc_id: docId },
-    });
+    const db = await pool.connect();
+    let createdConversationId;
+    let createdVectorStoreId;
+    let committed = false;
 
-    const vectorStore = await client.vectorStores.create({
-      name: `docassist-${docId}`,
-      metadata: { doc_id: docId },
-    });
+    try {
+      await db.query("BEGIN");
+      await db.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docId]);
 
-    const instructions = typeof maybeInstructions === "string" ? maybeInstructions : "";
+      const existingAfterLock = await fetchAndMaybeUpdate_(db);
+      if (existingAfterLock) {
+        await db.query("COMMIT");
+        committed = true;
+        return existingAfterLock;
+      }
 
-    await pool.query(
-      `
-        INSERT INTO docs_sessions (doc_id, conversation_id, vector_store_id, instructions, model)
-        VALUES ($1, $2, $3, $4, $5)
-      `,
-      [docId, conv.id, vectorStore.id, instructions, cfg.openaiModel]
-    );
+      const conv = await client.conversations.create({ metadata: { doc_id: docId } });
+      createdConversationId = conv?.id;
 
-    return {
-      doc_id: docId,
-      conversation_id: conv.id,
-      vector_store_id: vectorStore.id,
-      instructions,
-      model: cfg.openaiModel,
-    };
+      const vectorStore = await client.vectorStores.create({
+        name: `docassist-${docId}`,
+        metadata: { doc_id: docId },
+      });
+      createdVectorStoreId = vectorStore?.id;
+
+      await db.query(
+        `INSERT INTO docs_sessions (doc_id, conversation_id, vector_store_id, instructions, model)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [docId, createdConversationId, createdVectorStoreId, incoming, cfg.openaiModel]
+      );
+
+      await db.query("COMMIT");
+      committed = true;
+
+      return {
+        doc_id: docId,
+        conversation_id: createdConversationId,
+        vector_store_id: createdVectorStoreId,
+        instructions: incoming,
+        model: cfg.openaiModel,
+      };
+    } catch (err) {
+      if (!committed) {
+        try {
+          await db.query("ROLLBACK");
+        } catch (_) {
+          // best-effort
+        }
+      }
+
+      await bestEffortDeleteOpenAIResources_({
+        conversationId: createdConversationId,
+        vectorStoreId: createdVectorStoreId,
+      });
+
+      throw err;
+    } finally {
+      try {
+        db.release();
+      } catch (_) {
+        // best-effort
+      }
+    }
   }
 
   // ====== DB-ALAPÚ CHAT HISTORY STORE ======
@@ -828,10 +1021,25 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
             });
       if (instructions == null) return;
 
+      const replaceKnowledge = (() => {
+        if (req.body.replaceKnowledge == null) return false;
+        const v = req.body.replaceKnowledge;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        return s === "1" || s === "true" || s === "yes" || s === "on";
+      })();
+
       const session = await getOrCreateSession(
         String(docId),
         typeof instructions === "string" ? instructions : ""
       );
+
+      if (replaceKnowledge) {
+        await bestEffortReplaceKnowledgeForDoc_({
+          docId: String(docId),
+          vectorStoreId: session.vector_store_id,
+        });
+      }
 
       const title = String(docTitle || "document").replace(/[^a-zA-Z0-9._-]+/g, "_");
       const filename = `${title || "document"}_${String(docId).slice(0, 8)}.txt`;
@@ -909,10 +1117,25 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
             });
       if (instructions == null) return;
 
+      const replaceKnowledge = (() => {
+        if (req.body.replaceKnowledge == null) return false;
+        const v = req.body.replaceKnowledge;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        return s === "1" || s === "true" || s === "yes" || s === "on";
+      })();
+
       const session = await getOrCreateSession(
         String(docId),
         typeof instructions === "string" ? instructions : ""
       );
+
+      if (replaceKnowledge) {
+        await bestEffortReplaceKnowledgeForDoc_({
+          docId: String(docId),
+          vectorStoreId: session.vector_store_id,
+        });
+      }
 
       let buf;
       try {
