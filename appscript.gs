@@ -1114,9 +1114,15 @@ function appendChatTurnToDoc(userText, assistantText) {
 
   // Labels on their own lines; only the label is bold.
   insertLabelParagraph_('YOU:');
+  insertPlainParagraph_('');
   insertPlainParagraph_(String(userText || ''));
 
+  // Two blank lines between YOU and ASSISTANT sections.
+  insertPlainParagraph_('');
+  insertPlainParagraph_('');
+
   insertLabelParagraph_('ASSISTANT:');
+  insertPlainParagraph_('');
   insertPlainParagraph_(String(assistantText || ''));
 
   // Spacer line
