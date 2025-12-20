@@ -1071,21 +1071,56 @@ function appendChatTurnToDoc(userText, assistantText) {
   let insertAt = markerIdx + 1;
   const ts = new Date().toISOString();
 
-  const youLabel = body.insertParagraph(insertAt, '[' + ts + '] YOU:');
-  insertAt++;
-  try { youLabel.setBold(true); } catch (e) {}
+  const setAllBold_ = (paragraph, isBold) => {
+    try {
+      const t = paragraph && paragraph.editAsText ? paragraph.editAsText() : null;
+      if (t && typeof t.setBold === 'function') t.setBold(Boolean(isBold));
+    } catch (e) {
+      // best-effort
+    }
+  };
 
-  body.insertParagraph(insertAt, String(userText || ''));
-  insertAt++;
+  const insertPlainParagraph_ = (text) => {
+    const p = body.insertParagraph(insertAt, String(text || ''));
+    insertAt++;
+    setAllBold_(p, false);
+    return p;
+  };
 
-  const asstLabel = body.insertParagraph(insertAt, '[' + ts + '] ASSISTANT:');
-  insertAt++;
-  try { asstLabel.setBold(true); } catch (e) {}
+  const insertLabelParagraph_ = (label) => {
+    // Prevent bold “carryover” into the next paragraph by ending with a non-bold ZWSP.
+    const zwsp = '\u200B';
+    const full = String(label || '') + zwsp;
+    const p = body.insertParagraph(insertAt, full);
+    insertAt++;
+    try {
+      const t = p.editAsText();
+      // Default to non-bold
+      t.setBold(false);
+      // Bold only the label characters, keep trailing ZWSP non-bold.
+      const labelLen = String(label || '').length;
+      if (labelLen > 0) {
+        t.setBold(0, labelLen - 1, true);
+      }
+      t.setBold(labelLen, labelLen, false);
+    } catch (e) {
+      // best-effort
+    }
+    return p;
+  };
 
-  body.insertParagraph(insertAt, String(assistantText || ''));
-  insertAt++;
+  // Timestamp once for the whole turn, on its own line.
+  insertPlainParagraph_('[' + ts + ']');
 
-  body.insertParagraph(insertAt, '');
+  // Labels on their own lines; only the label is bold.
+  insertLabelParagraph_('YOU:');
+  insertPlainParagraph_(String(userText || ''));
+
+  insertLabelParagraph_('ASSISTANT:');
+  insertPlainParagraph_(String(assistantText || ''));
+
+  // Spacer line
+  insertPlainParagraph_('');
 
   log_('doc.chat_log.append', { ms: Date.now() - started });
 }
