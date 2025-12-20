@@ -347,9 +347,15 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         filename TEXT NOT NULL,
         sha256 TEXT NOT NULL,
         vector_store_file_id TEXT NOT NULL,
+        file_vector_store_id TEXT,
+        file_vector_store_file_id TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+
+    // Legacy installs: add new columns if they don't exist.
+    await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_id TEXT;`);
+    await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_file_id TEXT;`);
 
     // ----- Indexes & constraints (idempotent) -----
     // 1) Dedupe any legacy duplicates before adding unique index.
@@ -381,14 +387,29 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
     );
   }
 
-  async function recordVectorStoreFile(docId, kind, filename, sha256, vectorStoreFileId) {
+  async function recordVectorStoreFile(
+    docId,
+    kind,
+    filename,
+    sha256,
+    vectorStoreFileId,
+    { fileVectorStoreId = null, fileVectorStoreFileId = null } = {}
+  ) {
     await pool.query(
       `
-        INSERT INTO docs_files (doc_id, kind, filename, sha256, vector_store_file_id)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO docs_files (
+          doc_id,
+          kind,
+          filename,
+          sha256,
+          vector_store_file_id,
+          file_vector_store_id,
+          file_vector_store_file_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (doc_id, kind, sha256) DO NOTHING
       `,
-      [docId, kind, filename, sha256, vectorStoreFileId]
+      [docId, kind, filename, sha256, vectorStoreFileId, fileVectorStoreId, fileVectorStoreFileId]
     );
   }
 
@@ -404,6 +425,24 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       [docId, kind, sha256]
     );
     return result.rows?.[0]?.vector_store_file_id || null;
+  }
+
+  async function findExistingDocsFileByHash_(docId, kind, sha256) {
+    const result = await pool.query(
+      `
+        SELECT
+          id,
+          vector_store_file_id,
+          file_vector_store_id,
+          file_vector_store_file_id
+        FROM docs_files
+        WHERE doc_id = $1 AND kind = $2 AND sha256 = $3
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `,
+      [docId, kind, sha256]
+    );
+    return result.rows?.[0] || null;
   }
 
   async function bestEffortDeleteOpenAIResources_({ conversationId, vectorStoreId }) {
@@ -809,23 +848,67 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
           const row = s.rows?.[0];
 
           const f = await pool.query(
-            `SELECT vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
+            `SELECT vector_store_file_id, file_vector_store_id, file_vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
             [docId]
           );
-          const fileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
+          const docVsFileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
+          const fileVsIds = Array.from(
+            new Set((f.rows || []).map((r) => r.file_vector_store_id).filter(Boolean))
+          );
+          const fileVsFileIdsByStore = new Map();
+          for (const row of f.rows || []) {
+            const vsId = row.file_vector_store_id;
+            const vsFileId = row.file_vector_store_file_id;
+            if (!vsId || !vsFileId) continue;
+            const arr = fileVsFileIdsByStore.get(vsId) || [];
+            arr.push(vsFileId);
+            fileVsFileIdsByStore.set(vsId, arr);
+          }
 
           const conversationId = row?.conversation_id;
           const vectorStoreId = row?.vector_store_id;
 
           // Try deleting vector store files first.
           if (vectorStoreId && client?.vectorStores?.files) {
-            for (const fileId of fileIds) {
+            for (const fileId of docVsFileIds) {
               try {
                 const filesApi = client.vectorStores.files;
                 if (typeof filesApi.del === "function") {
                   await filesApi.del(vectorStoreId, fileId);
                 } else if (typeof filesApi.delete === "function") {
                   await filesApi.delete(vectorStoreId, fileId);
+                }
+              } catch (_) {
+                // best-effort
+              }
+            }
+          }
+
+          // Delete file-scoped vector stores (best-effort).
+          if (client?.vectorStores) {
+            for (const vsId of fileVsIds) {
+              // Try deleting the store files first (if we have them).
+              const vsFileIds = fileVsFileIdsByStore.get(vsId) || [];
+              if (vsFileIds.length && client?.vectorStores?.files) {
+                for (const fileId of vsFileIds) {
+                  try {
+                    const filesApi = client.vectorStores.files;
+                    if (typeof filesApi.del === "function") {
+                      await filesApi.del(vsId, fileId);
+                    } else if (typeof filesApi.delete === "function") {
+                      await filesApi.delete(vsId, fileId);
+                    }
+                  } catch (_) {
+                    // best-effort
+                  }
+                }
+              }
+
+              try {
+                if (typeof client.vectorStores.del === "function") {
+                  await client.vectorStores.del(vsId);
+                } else if (typeof client.vectorStores.delete === "function") {
+                  await client.vectorStores.delete(vsId);
                 }
               } catch (_) {
                 // best-effort
@@ -878,6 +961,49 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         openaiCleanup: {
           enabled: cleanupOpenAI,
         },
+      });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  // ====== V2 LIST FILES ======
+  // Returns known uploaded/synced files for a doc.
+  app.get("/v2/list-files", async (req, res) => {
+    try {
+      const docId = requireNonEmptyTrimmedString(req, res, "docId", req.query?.docId, {
+        maxChars: cfg.maxDocIdChars,
+      });
+      if (docId == null) return;
+
+      const result = await pool.query(
+        `
+          SELECT
+            id,
+            kind,
+            filename,
+            sha256,
+            created_at,
+            file_vector_store_id
+          FROM docs_files
+          WHERE doc_id = $1
+          ORDER BY created_at DESC, id DESC
+        `,
+        [String(docId)]
+      );
+
+      return res.json({
+        ok: true,
+        docId: String(docId),
+        files: (result.rows || []).map((r) => ({
+          id: r.id,
+          kind: r.kind,
+          filename: r.filename,
+          sha256: r.sha256,
+          createdAt: r.created_at,
+          hasFileScope: Boolean(r.file_vector_store_id),
+        })),
       });
     } catch (err) {
       logger.error(err);
@@ -1046,16 +1172,45 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       const buf = Buffer.from(docText, "utf8");
       const hash = sha256Hex(buf);
 
-      const existingVsf = await findExistingVectorStoreFile(String(docId), "doc", hash);
-      if (existingVsf) {
-        return res.json({ vectorStoreFileId: existingVsf, reused: true });
+      const existing = await findExistingDocsFileByHash_(String(docId), "doc", hash);
+      if (existing?.vector_store_file_id) {
+        return res.json({
+          vectorStoreFileId: existing.vector_store_file_id,
+          docsFileId: existing.id,
+          reused: true,
+          hasFileScope: Boolean(existing.file_vector_store_id),
+        });
       }
 
-      const uploadable = await toFile(buf, filename, { type: "text/plain" });
-      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadable);
+      // Create a per-file vector store for file-scoped chat.
+      const fileVectorStore = await client.vectorStores.create({
+        name: `docassist-${String(docId)}-doc-${hash.slice(0, 12)}`,
+        metadata: { doc_id: String(docId), kind: "doc", sha256: hash },
+      });
+      const fileVectorStoreId = fileVectorStore?.id;
 
-      await recordVectorStoreFile(String(docId), "doc", filename, hash, vsFile.id);
-      return res.json({ vectorStoreFileId: vsFile.id, reused: false });
+      const uploadableDoc = await toFile(buf, filename, { type: "text/plain" });
+      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableDoc);
+
+      const uploadableFileScope = await toFile(buf, filename, { type: "text/plain" });
+      const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+        fileVectorStoreId,
+        uploadableFileScope
+      );
+
+      await recordVectorStoreFile(String(docId), "doc", filename, hash, vsFile.id, {
+        fileVectorStoreId,
+        fileVectorStoreFileId: fileScopeVsf?.id || null,
+      });
+
+      // Best-effort: fetch docs_files id for UI convenience.
+      const created = await findExistingDocsFileByHash_(String(docId), "doc", hash);
+      return res.json({
+        vectorStoreFileId: vsFile.id,
+        docsFileId: created?.id,
+        fileVectorStoreId,
+        reused: false,
+      });
     } catch (err) {
       logger.error(err);
       return res
@@ -1151,18 +1306,49 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       const hash = sha256Hex(buf);
       const safeName = String(filename).replace(/[^a-zA-Z0-9._-]+/g, "_");
 
-      const existingVsf = await findExistingVectorStoreFile(String(docId), "upload", hash);
-      if (existingVsf) {
-        return res.json({ vectorStoreFileId: existingVsf, reused: true });
+      const existing = await findExistingDocsFileByHash_(String(docId), "upload", hash);
+      if (existing?.vector_store_file_id) {
+        return res.json({
+          vectorStoreFileId: existing.vector_store_file_id,
+          docsFileId: existing.id,
+          reused: true,
+          hasFileScope: Boolean(existing.file_vector_store_id),
+        });
       }
 
-      const uploadable = await toFile(buf, safeName, {
+      // Create a per-file vector store for file-scoped chat.
+      const fileVectorStore = await client.vectorStores.create({
+        name: `docassist-${String(docId)}-upload-${hash.slice(0, 12)}`,
+        metadata: { doc_id: String(docId), kind: "upload", sha256: hash, filename: safeName },
+      });
+      const fileVectorStoreId = fileVectorStore?.id;
+
+      const uploadableDoc = await toFile(buf, safeName, {
         type: String(mimeType || "application/octet-stream"),
       });
-      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadable);
-      await recordVectorStoreFile(String(docId), "upload", safeName, hash, vsFile.id);
+      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableDoc);
 
-      return res.json({ vectorStoreFileId: vsFile.id, reused: false });
+      const uploadableFileScope = await toFile(buf, safeName, {
+        type: String(mimeType || "application/octet-stream"),
+      });
+      const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+        fileVectorStoreId,
+        uploadableFileScope
+      );
+
+      await recordVectorStoreFile(String(docId), "upload", safeName, hash, vsFile.id, {
+        fileVectorStoreId,
+        fileVectorStoreFileId: fileScopeVsf?.id || null,
+      });
+
+      const created = await findExistingDocsFileByHash_(String(docId), "upload", hash);
+
+      return res.json({
+        vectorStoreFileId: vsFile.id,
+        docsFileId: created?.id,
+        fileVectorStoreId,
+        reused: false,
+      });
     } catch (err) {
       logger.error(err);
       return res
@@ -1208,6 +1394,30 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         typeof instructions === "string" ? instructions : ""
       );
 
+      let scopedVectorStoreId = null;
+      let scopedFileId = null;
+      if (req.body.fileId != null && String(req.body.fileId).trim() !== "") {
+        const n = Number.parseInt(String(req.body.fileId), 10);
+        if (Number.isFinite(n) && n > 0) {
+          scopedFileId = n;
+          try {
+            const f = await pool.query(
+              `
+                SELECT file_vector_store_id
+                FROM docs_files
+                WHERE doc_id = $1 AND id = $2
+                LIMIT 1
+              `,
+              [String(docId), scopedFileId]
+            );
+            scopedVectorStoreId = f.rows?.[0]?.file_vector_store_id || null;
+          } catch (_) {
+            // best-effort: fall back to doc vector store
+            scopedVectorStoreId = null;
+          }
+        }
+      }
+
       const msgStr = String(userMessage || "");
       const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
       if (askedModel) {
@@ -1233,7 +1443,7 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
         tools: [
           {
             type: "file_search",
-            vector_store_ids: [session.vector_store_id],
+            vector_store_ids: [scopedVectorStoreId || session.vector_store_id],
           },
         ],
         input: msgStr,
@@ -1252,6 +1462,9 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
       return res.json({
         reply: replyText,
         responseId: response.id,
+        scope: scopedVectorStoreId
+          ? { type: "file", fileId: scopedFileId }
+          : { type: "all" },
       });
     } catch (err) {
       logger.error(err);

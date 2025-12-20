@@ -235,13 +235,20 @@ function getChatSidebarHtml_() {
         Auto-sync before sending
       </label>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
-        <input id="autoAppend" type="checkbox" />
+        <input id="autoAppend" type="checkbox" checked />
         Auto-append to Chat Log
       </label>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="replaceKnowledge" type="checkbox" />
         Replace previous knowledge
       </label>
+    </div>
+    <div class="row">
+      <label>Scope (file picker)</label>
+      <select id="fileScope">
+        <option value="">All files</option>
+      </select>
+      <div class="small">Pick a file to scope chat to it. Upload/sync creates selectable items.</div>
     </div>
 
     <div class="row">
@@ -513,7 +520,9 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn'].forEach(id => el(id).disabled = disabled);
+        ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
+          try { el(id).disabled = disabled; } catch (e) {}
+        });
       }
 
       el('copyLastBtn').addEventListener('click', () => copyLastReply_());
@@ -554,16 +563,65 @@ function getChatSidebarHtml_() {
           el('baseUrl').value = state.baseUrl || '';
           el('token').value = state.token || '';
           el('instructions').value = state.instructions || '';
+          try { if (el('autoAppend')) el('autoAppend').checked = true; } catch (e) {}
+          try { if (el('fileScope')) el('fileScope').value = (state.fileScopeId != null ? String(state.fileScopeId) : ''); } catch (e) {}
           if (settingsEl) settingsEl.open = !state.baseUrl;
           setStatus(state.baseUrl ? 'Ready.' : 'Set Backend URL first (open Connection settings).');
 
           if (state.baseUrl) {
             refreshBackendInfo_();
+            refreshFiles_();
           }
         }).withFailureHandler((err) => {
           setStatus('Error loading state: ' + (err && err.message ? err.message : err));
         }).getSidebarState();
       }
+
+      function setFileScope_(fileId) {
+        google.script.run
+          .withFailureHandler(() => { /* best-effort */ })
+          .setFileScopeIdForThisDocument(fileId);
+      }
+
+      function refreshFiles_() {
+        const sel = el('fileScope');
+        if (!sel) return;
+        const current = String(sel.value || '');
+
+        // Keep the first option (All files).
+        while (sel.options.length > 1) sel.remove(1);
+
+        google.script.run
+          .withSuccessHandler((resp) => {
+            const files = (resp && resp.files) ? resp.files : [];
+            for (const f of files) {
+              if (!f || f.id == null) continue;
+              const opt = document.createElement('option');
+              opt.value = String(f.id);
+              const name = String(f.filename || '(unnamed)');
+              const kind = String(f.kind || '');
+              opt.textContent = (kind ? ('[' + kind + '] ') : '') + name;
+              if (f.hasFileScope === false) {
+                opt.textContent += ' (not selectable yet)';
+                opt.disabled = true;
+              }
+              sel.appendChild(opt);
+            }
+
+            // Restore selection if still present.
+            const maybe = Array.from(sel.options).some(o => o.value === current);
+            sel.value = maybe ? current : '';
+            setFileScope_(sel.value);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Failed to load files: ' + (err && err.message ? err.message : err));
+          })
+          .listFilesForThisDocument();
+      }
+
+      el('fileScope').addEventListener('change', () => {
+        try { setFileScope_(el('fileScope').value); } catch (e) {}
+      });
 
       function refreshBackendInfo_() {
         const infoEl = document.getElementById('backendInfo');
@@ -653,6 +711,7 @@ function getChatSidebarHtml_() {
         setStatus('Syncing tab...');
         google.script.run.withSuccessHandler(() => {
           setStatus('Tab synced.');
+          try { refreshFiles_(); } catch (e) {}
           disableAll(false);
         }).withFailureHandler((err) => {
           setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
@@ -682,6 +741,7 @@ function getChatSidebarHtml_() {
         setStatus('Uploading file...');
         google.script.run.withSuccessHandler(() => {
           setStatus('File uploaded and indexed.');
+          try { refreshFiles_(); } catch (e) {}
           disableAll(false);
         }).withFailureHandler((err) => {
           setStatus('Error uploading: ' + (err && err.message ? err.message : err));
@@ -716,7 +776,7 @@ function getChatSidebarHtml_() {
           }).withFailureHandler((err) => {
             setStatus('Error: ' + (err && err.message ? err.message : err));
             disableAll(false);
-          }).sendChatMessage(text, el('instructions').value);
+          }).sendChatMessage(text, el('instructions').value, el('fileScope') ? el('fileScope').value : '');
         };
 
         if (el('autoSync').checked) {
@@ -746,15 +806,33 @@ function getSidebarState() {
   const token = props.getProperty('DOCASSIST_TOKEN') || '';
   const docProps = PropertiesService.getDocumentProperties();
   const instructions = docProps.getProperty('DOCASSIST_INSTRUCTIONS') || '';
+  const fileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
 
   log_('sidebar.get_state', {
     hasBaseUrl: Boolean(baseUrl),
     hasToken: Boolean(token),
     instructionsLen: String(instructions || '').length,
+    hasFileScope: Boolean(String(fileScopeId || '').trim()),
     ms: Date.now() - started
   });
 
-  return { baseUrl: baseUrl, token: token, instructions: instructions };
+  return { baseUrl: baseUrl, token: token, instructions: instructions, fileScopeId: fileScopeId };
+}
+
+function setFileScopeIdForThisDocument(fileScopeId) {
+  const docProps = PropertiesService.getDocumentProperties();
+  const v = String(fileScopeId || '').trim();
+  if (!v) {
+    docProps.deleteProperty('DOCASSIST_FILE_SCOPE_ID');
+  } else {
+    docProps.setProperty('DOCASSIST_FILE_SCOPE_ID', v);
+  }
+}
+
+function listFilesForThisDocument() {
+  const docId = DocumentApp.getActiveDocument().getId();
+  const resp = callBackendV2Get_('/v2/list-files?docId=' + encodeURIComponent(String(docId)));
+  return resp;
 }
 
 function saveSidebarSettings(baseUrl, token) {
@@ -1016,16 +1094,23 @@ function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOv
   return resp;
 }
 
-function sendChatMessage(userMessage, instructionsOverride) {
+function sendChatMessage(userMessage, instructionsOverride, fileScopeIdOverride) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
   ensureV2Session_(instructions);
 
+  const docProps = PropertiesService.getDocumentProperties();
+  const storedFileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
+  const fileScopeId = String(
+    (typeof fileScopeIdOverride === 'string' ? fileScopeIdOverride : '') || storedFileScopeId || ''
+  ).trim();
+
   const resp = callBackendV2_('/v2/chat', {
     docId: doc.getId(),
     userMessage: String(userMessage || ''),
-    instructions: instructions
+    instructions: instructions,
+    fileId: fileScopeId
   });
 
   log_('v2.chat', {
