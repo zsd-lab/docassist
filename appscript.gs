@@ -235,6 +235,10 @@ function getChatSidebarHtml_() {
         Auto-sync before sending
       </label>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
+        <input id="autoAppend" type="checkbox" />
+        Auto-append to Chat Log
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="replaceKnowledge" type="checkbox" />
         Replace previous knowledge
       </label>
@@ -696,6 +700,17 @@ function getChatSidebarHtml_() {
           setStatus('Thinking...');
           google.script.run.withSuccessHandler((reply) => {
             addMsg('Assistant', reply || '(empty)');
+
+            if (el('autoAppend') && el('autoAppend').checked) {
+              try {
+                google.script.run
+                  .withFailureHandler(() => { /* best-effort */ })
+                  .appendChatTurnToDoc(text, reply || '');
+              } catch (e) {
+                // best-effort
+              }
+            }
+
             setStatus('Ready.');
             disableAll(false);
           }).withFailureHandler((err) => {
@@ -1022,6 +1037,57 @@ function sendChatMessage(userMessage, instructionsOverride) {
   });
 
   return String(resp.reply || '');
+}
+
+function appendChatTurnToDoc(userText, assistantText) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+  const body = doc.getBody();
+
+  const marker = 'Chat Log';
+  const markerLine = '=== ' + marker + ' ===';
+
+  // Find the last marker paragraph (exact match), if any.
+  let markerIdx = -1;
+  const n = body.getNumChildren();
+  for (let i = 0; i < n; i++) {
+    const child = body.getChild(i);
+    if (!child || typeof child.getType !== 'function') continue;
+    if (child.getType() !== DocumentApp.ElementType.PARAGRAPH) continue;
+    const p = child.asParagraph();
+    const t = String(p.getText() || '').trim();
+    if (t === markerLine) markerIdx = i;
+  }
+
+  // If no marker, append it at the bottom.
+  if (markerIdx < 0) {
+    const p = body.appendParagraph(markerLine);
+    try { p.setHeading(DocumentApp.ParagraphHeading.HEADING2); } catch (e) {}
+    body.appendParagraph('');
+    markerIdx = body.getNumChildren() - 2;
+  }
+
+  // Insert immediately after the marker section start.
+  let insertAt = markerIdx + 1;
+  const ts = new Date().toISOString();
+
+  const youLabel = body.insertParagraph(insertAt, '[' + ts + '] YOU:');
+  insertAt++;
+  try { youLabel.setBold(true); } catch (e) {}
+
+  body.insertParagraph(insertAt, String(userText || ''));
+  insertAt++;
+
+  const asstLabel = body.insertParagraph(insertAt, '[' + ts + '] ASSISTANT:');
+  insertAt++;
+  try { asstLabel.setBold(true); } catch (e) {}
+
+  body.insertParagraph(insertAt, String(assistantText || ''));
+  insertAt++;
+
+  body.insertParagraph(insertAt, '');
+
+  log_('doc.chat_log.append', { ms: Date.now() - started });
 }
 
 function insertTextIntoDocFromSidebar(text) {
