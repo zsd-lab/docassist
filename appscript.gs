@@ -231,12 +231,6 @@ function getChatSidebarHtml_() {
     <div class="row controls">
       <button id="syncBtn">Sync current tab</button>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
-        Tab
-        <select id="tabSelect" style="max-width: 180px;">
-          <option value="">Loading…</option>
-        </select>
-      </label>
-      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="autoSync" type="checkbox" />
         Auto-sync before sending
       </label>
@@ -516,9 +510,6 @@ function getChatSidebarHtml_() {
 
       function disableAll(disabled) {
         ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn'].forEach(id => el(id).disabled = disabled);
-        try {
-          if (el('tabSelect')) el('tabSelect').disabled = disabled;
-        } catch (e) {}
       }
 
       el('copyLastBtn').addEventListener('click', () => copyLastReply_());
@@ -564,60 +555,10 @@ function getChatSidebarHtml_() {
 
           if (state.baseUrl) {
             refreshBackendInfo_();
-            refreshTabs_();
           }
         }).withFailureHandler((err) => {
           setStatus('Error loading state: ' + (err && err.message ? err.message : err));
         }).getSidebarState();
-      }
-
-      function refreshTabs_() {
-        const sel = el('tabSelect');
-        if (!sel) return;
-
-        sel.innerHTML = '';
-        const opt = document.createElement('option');
-        opt.value = '';
-        opt.textContent = 'Loading…';
-        sel.appendChild(opt);
-
-        google.script.run
-          .withSuccessHandler((tabs) => {
-            try {
-              const list = Array.isArray(tabs) ? tabs : [];
-              sel.innerHTML = '';
-              if (!list.length) {
-                const o = document.createElement('option');
-                o.value = '';
-                o.textContent = '(No tabs found)';
-                sel.appendChild(o);
-                return;
-              }
-              let selectedId = '';
-              list.forEach((t) => {
-                const o = document.createElement('option');
-                o.value = String(t && t.id != null ? t.id : '');
-                o.textContent = String(t && t.title ? t.title : 'Tab');
-                if (t && t.isActive) selectedId = o.value;
-                sel.appendChild(o);
-              });
-              if (selectedId) sel.value = selectedId;
-            } catch (e) {
-              sel.innerHTML = '';
-              const o = document.createElement('option');
-              o.value = '';
-              o.textContent = '(Tabs unavailable)';
-              sel.appendChild(o);
-            }
-          })
-          .withFailureHandler((err) => {
-            sel.innerHTML = '';
-            const o = document.createElement('option');
-            o.value = '';
-            o.textContent = 'Error loading tabs';
-            sel.appendChild(o);
-          })
-          .getDocTabsForSidebar();
       }
 
       function refreshBackendInfo_() {
@@ -654,7 +595,6 @@ function getChatSidebarHtml_() {
         google.script.run.withSuccessHandler(() => {
           setStatus('Settings saved.');
           refreshBackendInfo_();
-          refreshTabs_();
           disableAll(false);
         }).withFailureHandler((err) => {
           setStatus('Error saving settings: ' + (err && err.message ? err.message : err));
@@ -707,14 +647,13 @@ function getChatSidebarHtml_() {
       el('syncBtn').addEventListener('click', () => {
         disableAll(true);
         setStatus('Syncing tab...');
-        const tabId = el('tabSelect') ? String(el('tabSelect').value || '') : '';
         google.script.run.withSuccessHandler(() => {
           setStatus('Tab synced.');
           disableAll(false);
         }).withFailureHandler((err) => {
           setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
           disableAll(false);
-        }).syncTabToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked), tabId);
+        }).syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
       });
 
       el('uploadBtn').addEventListener('click', async () => {
@@ -767,13 +706,12 @@ function getChatSidebarHtml_() {
 
         if (el('autoSync').checked) {
           setStatus('Auto-syncing tab...');
-          const tabId = el('tabSelect') ? String(el('tabSelect').value || '') : '';
           google.script.run.withSuccessHandler(() => doSend())
             .withFailureHandler((err) => {
               setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
               disableAll(false);
             })
-            .syncTabToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked), tabId);
+            .syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
         } else {
           doSend();
         }
@@ -1001,69 +939,12 @@ function ensureV2Session_(instructionsOverride) {
 
   return result;
 }
-
-function getDocTabsForSidebar() {
-  const doc = DocumentApp.getActiveDocument();
-
-  // Fallback for older runtimes / accounts without tab support.
-  const hasTabs = doc && typeof doc.getTabs === 'function';
-  if (!hasTabs) {
-    return [{ id: '0', title: doc.getName ? doc.getName() : 'Document', isActive: true }];
-  }
-
-  const tabs = doc.getTabs() || [];
-  const out = [];
-
-  // We may not have a reliable “active tab” API across all runtimes.
-  // Best-effort: mark the first tab active.
-  for (let i = 0; i < tabs.length; i++) {
-    const t = tabs[i];
-    let title = '';
-    try {
-      title = (t && typeof t.getTitle === 'function') ? t.getTitle() : '';
-    } catch (e) {
-      title = '';
-    }
-    out.push({
-      id: String(i),
-      title: title || ('Tab ' + (i + 1)),
-      isActive: i === 0,
-    });
-  }
-
-  return out.length ? out : [{ id: '0', title: doc.getName ? doc.getName() : 'Document', isActive: true }];
-}
-
-function getTabTextById_(tabId) {
-  const doc = DocumentApp.getActiveDocument();
-  const id = String(tabId || '').trim();
-
-  const hasTabs = doc && typeof doc.getTabs === 'function';
-  if (!hasTabs) {
-    return doc.getBody().getText();
-  }
-
-  const tabs = doc.getTabs() || [];
-  const idx = Number.parseInt(id || '0', 10);
-  const t = tabs && tabs.length ? tabs[Math.max(0, Math.min(tabs.length - 1, isNaN(idx) ? 0 : idx))] : null;
-
-  try {
-    if (t && typeof t.getBody === 'function') {
-      return t.getBody().getText();
-    }
-  } catch (e) {}
-
-  // Fallback to document body.
-  return doc.getBody().getText();
-}
-
-function syncTabToKnowledge(instructionsOverride, replaceKnowledge, tabId) {
+function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
-
-  const docText = getTabTextById_(tabId);
+  const docText = doc.getBody().getText();
   if (!docText || !docText.trim()) {
-    log_('v2.sync_tab.empty', { docId: doc.getId(), tabId: String(tabId || '') });
+    log_('v2.sync_doc.empty', { docId: doc.getId() });
     throw new Error('This tab is empty.');
   }
 
@@ -1078,10 +959,9 @@ function syncTabToKnowledge(instructionsOverride, replaceKnowledge, tabId) {
     replaceKnowledge: Boolean(replaceKnowledge)
   });
 
-  log_('v2.sync_tab', {
+  log_('v2.sync_doc', {
     docId: doc.getId(),
     docTitle: doc.getName(),
-    tabId: String(tabId || ''),
     docTextLen: String(docText || '').length,
     instructionsLen: String(instructions || '').length,
     replaceKnowledge: Boolean(replaceKnowledge),
@@ -1090,11 +970,6 @@ function syncTabToKnowledge(instructionsOverride, replaceKnowledge, tabId) {
   });
 
   return resp;
-}
-
-function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge) {
-  // Back-compat for menu/legacy calls: treat "current" tab as the first tab.
-  return syncTabToKnowledge(instructionsOverride, replaceKnowledge, '0');
 }
 
 function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOverride, replaceKnowledge) {
