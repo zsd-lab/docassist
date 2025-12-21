@@ -175,8 +175,7 @@ function getChatSidebarHtml_() {
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       html, body { background: #fff; }
-      html, body { height: 100%; }
-      body { font-family: Arial, sans-serif; font-size: 13px; margin: 0; padding: 12px; height: 100%; min-height: 0; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+      body { font-family: Arial, sans-serif; font-size: 13px; margin: 0; padding: 12px; box-sizing: border-box; overflow-y: auto; overflow-x: hidden; }
       .row { margin-bottom: 10px; }
       label { display: block; font-weight: 600; margin-bottom: 4px; }
       input[type="text"], input[type="password"], textarea {
@@ -187,9 +186,9 @@ function getChatSidebarHtml_() {
       button.primary { background: #1a73e8; color: #fff; border-color: #1a73e8; }
       button:disabled { opacity: 0.6; cursor: not-allowed; }
       .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-      .top-area { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-      .chat-row { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-      .chat { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; flex: 1 1 auto; min-height: 0; overflow: auto; background: #fafafa; overflow-wrap: anywhere; word-break: break-word; }
+      .top-area { }
+      .chat-row { }
+      .chat { border: 1px solid #dadce0; border-radius: 6px; padding: 8px; height: 260px; overflow: auto; background: #fafafa; overflow-wrap: anywhere; word-break: break-word; }
       #msg { min-height: 110px; max-height: 180px; }
       .msg { margin: 8px 0; }
       .role { font-weight: 700; margin-right: 6px; }
