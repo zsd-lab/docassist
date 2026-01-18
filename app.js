@@ -1220,6 +1220,124 @@ jon, mért eredményekkel és stabil kapcsolati tőkével, etikus keretek közö
     }
   });
 
+  app.post("/v2/sync-tab", async (req, res) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const docId = requireNonEmptyTrimmedString(req, res, "docId", req.body.docId, {
+        maxChars: cfg.maxDocIdChars,
+      });
+      if (docId == null) return;
+
+      const tabId = requireNonEmptyTrimmedString(req, res, "tabId", req.body.tabId, {
+        maxChars: 256,
+      });
+      if (tabId == null) return;
+
+      const tabText = requireString(req, res, "tabText", req.body.tabText, {
+        maxChars: cfg.maxDocTextChars,
+        allowEmpty: true,
+      });
+      if (tabText == null) return;
+
+      const tabTitle =
+        typeof req.body.tabTitle === "undefined"
+          ? ""
+          : requireString(req, res, "tabTitle", req.body.tabTitle, {
+              maxChars: cfg.maxDocTitleChars,
+              allowEmpty: true,
+            });
+      if (tabTitle == null) return;
+
+      const instructions =
+        typeof req.body.instructions === "undefined"
+          ? ""
+          : requireString(req, res, "instructions", req.body.instructions, {
+              maxChars: cfg.maxInstructionsChars,
+              allowEmpty: true,
+            });
+      if (instructions == null) return;
+
+      const replaceKnowledge = (() => {
+        if (req.body.replaceKnowledge == null) return false;
+        const v = req.body.replaceKnowledge;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        return s === "1" || s === "true" || s === "yes" || s === "on";
+      })();
+
+      const session = await getOrCreateSession(
+        String(docId),
+        typeof instructions === "string" ? instructions : ""
+      );
+
+      if (replaceKnowledge) {
+        await bestEffortReplaceKnowledgeForDoc_({
+          docId: String(docId),
+          vectorStoreId: session.vector_store_id,
+        });
+      }
+
+      // Hash includes tabId to avoid cross-tab dedupe collisions.
+      const buf = Buffer.from(tabText, "utf8");
+      const hash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${String(tabText)}`, "utf8"));
+
+      const existing = await findExistingDocsFileByHash_(String(docId), "tab", hash);
+      if (existing?.vector_store_file_id) {
+        return res.json({
+          vectorStoreFileId: existing.vector_store_file_id,
+          docsFileId: existing.id,
+          reused: true,
+          hasFileScope: Boolean(existing.file_vector_store_id),
+        });
+      }
+
+      const safeTabTitle = String(tabTitle || "tab").replace(/[^a-zA-Z0-9._-]+/g, "_");
+      const safeTabId = String(tabId).replace(/[^a-zA-Z0-9._-]+/g, "_");
+      const safeDocPrefix = String(docId).slice(0, 8);
+      let filename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${safeDocPrefix}.txt`;
+      if (filename.length > cfg.maxFilenameChars) {
+        filename = filename.slice(0, cfg.maxFilenameChars);
+      }
+
+      const fileVectorStore = await client.vectorStores.create({
+        name: `docassist-${String(docId)}-tab-${hash.slice(0, 12)}`,
+        metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: hash },
+      });
+      const fileVectorStoreId = fileVectorStore?.id;
+
+      const uploadableTab = await toFile(buf, filename, { type: "text/plain" });
+      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableTab);
+
+      const uploadableFileScope = await toFile(buf, filename, { type: "text/plain" });
+      const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+        fileVectorStoreId,
+        uploadableFileScope
+      );
+
+      await recordVectorStoreFile(String(docId), "tab", filename, hash, vsFile.id, {
+        fileVectorStoreId,
+        fileVectorStoreFileId: fileScopeVsf?.id || null,
+      });
+
+      // Best-effort: fetch docs_files id for UI convenience.
+      const created = await findExistingDocsFileByHash_(String(docId), "tab", hash);
+      return res.json({
+        vectorStoreFileId: vsFile.id,
+        docsFileId: created?.id,
+        fileVectorStoreId,
+        reused: false,
+      });
+    } catch (err) {
+      logger.error(err);
+      return res
+        .status(500)
+        .json(jsonError(req, err.message || "Internal server error"));
+    }
+  });
+
   app.post("/v2/upload-file", async (req, res) => {
     try {
       if (!isPlainObject(req.body)) {

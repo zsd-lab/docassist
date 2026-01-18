@@ -229,6 +229,13 @@ function getChatSidebarHtml_() {
 
     <div class="row controls">
       <button id="syncBtn">Sync current tab</button>
+      <button id="syncAllBtn">Sync all tabs</button>
+      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
+        Tab
+        <select id="tabPicker" style="max-width: 220px;">
+          <option value="">Auto (active/first)</option>
+        </select>
+      </label>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="autoSync" type="checkbox" />
         Auto-sync before sending
@@ -519,7 +526,7 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','resetServerBtn','syncBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
+        ['saveSettingsBtn','resetServerBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
           try { el(id).disabled = disabled; } catch (e) {}
         });
       }
@@ -564,12 +571,14 @@ function getChatSidebarHtml_() {
           el('instructions').value = state.instructions || '';
           try { if (el('autoAppend')) el('autoAppend').checked = true; } catch (e) {}
           try { if (el('fileScope')) el('fileScope').value = (state.fileScopeId != null ? String(state.fileScopeId) : ''); } catch (e) {}
+          try { if (el('tabPicker')) el('tabPicker').value = (state.selectedTabId != null ? String(state.selectedTabId) : ''); } catch (e) {}
           if (settingsEl) settingsEl.open = !state.baseUrl;
           setStatus(state.baseUrl ? 'Ready.' : 'Set Backend URL first (open Connection settings).');
 
           if (state.baseUrl) {
             refreshBackendInfo_();
             refreshFiles_();
+            refreshTabs_();
           }
         }).withFailureHandler((err) => {
           setStatus('Error loading state: ' + (err && err.message ? err.message : err));
@@ -580,6 +589,12 @@ function getChatSidebarHtml_() {
         google.script.run
           .withFailureHandler(() => { /* best-effort */ })
           .setFileScopeIdForThisDocument(fileId);
+      }
+
+      function setTabSelection_(tabId) {
+        google.script.run
+          .withFailureHandler(() => { /* best-effort */ })
+          .setSelectedTabIdForThisDocument(tabId);
       }
 
       function refreshFiles_() {
@@ -620,6 +635,39 @@ function getChatSidebarHtml_() {
 
       el('fileScope').addEventListener('change', () => {
         try { setFileScope_(el('fileScope').value); } catch (e) {}
+      });
+
+      function refreshTabs_() {
+        const sel = el('tabPicker');
+        if (!sel) return;
+        const current = String(sel.value || '');
+
+        while (sel.options.length > 1) sel.remove(1);
+
+        google.script.run
+          .withSuccessHandler((resp) => {
+            const tabs = (resp && resp.tabs) ? resp.tabs : [];
+            for (const t of tabs) {
+              if (!t || !t.tabId) continue;
+              const opt = document.createElement('option');
+              opt.value = String(t.tabId);
+              const title = String(t.title || '').trim();
+              opt.textContent = title ? title : ('Tab ' + String(t.tabId).slice(0, 8));
+              sel.appendChild(opt);
+            }
+
+            const maybe = Array.from(sel.options).some(o => o.value === current);
+            sel.value = maybe ? current : (sel.value || '');
+            setTabSelection_(sel.value);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Failed to load tabs: ' + (err && err.message ? err.message : err));
+          })
+          .listTabsForThisDocument();
+      }
+
+      el('tabPicker').addEventListener('change', () => {
+        try { setTabSelection_(el('tabPicker').value); } catch (e) {}
       });
 
       function refreshBackendInfo_() {
@@ -715,7 +763,20 @@ function getChatSidebarHtml_() {
         }).withFailureHandler((err) => {
           setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
           disableAll(false);
-        }).syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
+        }).syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked), el('tabPicker') ? el('tabPicker').value : '');
+      });
+
+      el('syncAllBtn').addEventListener('click', () => {
+        disableAll(true);
+        setStatus('Syncing all tabs...');
+        google.script.run.withSuccessHandler(() => {
+          setStatus('All tabs synced.');
+          try { refreshFiles_(); } catch (e) {}
+          disableAll(false);
+        }).withFailureHandler((err) => {
+          setStatus('Error syncing tabs: ' + (err && err.message ? err.message : err));
+          disableAll(false);
+        }).syncAllTabsToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
       });
 
       el('uploadBtn').addEventListener('click', async () => {
@@ -785,7 +846,7 @@ function getChatSidebarHtml_() {
               setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
               disableAll(false);
             })
-            .syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
+            .syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked), el('tabPicker') ? el('tabPicker').value : '');
         } else {
           doSend();
         }
@@ -806,16 +867,18 @@ function getSidebarState() {
   const docProps = PropertiesService.getDocumentProperties();
   const instructions = docProps.getProperty('DOCASSIST_INSTRUCTIONS') || '';
   const fileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
+  const selectedTabId = docProps.getProperty('DOCASSIST_SELECTED_TAB_ID') || '';
 
   log_('sidebar.get_state', {
     hasBaseUrl: Boolean(baseUrl),
     hasToken: Boolean(token),
     instructionsLen: String(instructions || '').length,
     hasFileScope: Boolean(String(fileScopeId || '').trim()),
+    hasSelectedTab: Boolean(String(selectedTabId || '').trim()),
     ms: Date.now() - started
   });
 
-  return { baseUrl: baseUrl, token: token, instructions: instructions, fileScopeId: fileScopeId };
+  return { baseUrl: baseUrl, token: token, instructions: instructions, fileScopeId: fileScopeId, selectedTabId: selectedTabId };
 }
 
 function setFileScopeIdForThisDocument(fileScopeId) {
@@ -828,10 +891,29 @@ function setFileScopeIdForThisDocument(fileScopeId) {
   }
 }
 
+function setSelectedTabIdForThisDocument(tabId) {
+  const docProps = PropertiesService.getDocumentProperties();
+  const v = String(tabId || '').trim();
+  if (!v) {
+    docProps.deleteProperty('DOCASSIST_SELECTED_TAB_ID');
+  } else {
+    docProps.setProperty('DOCASSIST_SELECTED_TAB_ID', v);
+  }
+}
+
 function listFilesForThisDocument() {
   const docId = DocumentApp.getActiveDocument().getId();
   const resp = callBackendV2Get_('/v2/list-files?docId=' + encodeURIComponent(String(docId)));
   return resp;
+}
+
+function listTabsForThisDocument() {
+  const doc = DocumentApp.getActiveDocument();
+  const tabs = getTabsWithTextForActiveDocument_().map((t) => ({
+    tabId: String(t.tabId),
+    title: String(t.title || '')
+  }));
+  return { ok: true, docId: doc.getId(), tabs: tabs };
 }
 
 function saveSidebarSettings(baseUrl, token) {
@@ -1031,37 +1113,282 @@ function ensureV2Session_(instructionsOverride) {
 
   return result;
 }
-function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge) {
+
+// ====== GOOGLE DOCS TABS (REST API) ======
+
+function fetchDocsDocumentRest_(docId) {
   const started = Date.now();
-  const doc = DocumentApp.getActiveDocument();
-  const docText = doc.getBody().getText();
-  if (!docText || !docText.trim()) {
-    log_('v2.sync_doc.empty', { docId: doc.getId() });
-    throw new Error('This tab is empty.');
+  const url = 'https://docs.googleapis.com/v1/documents/' + encodeURIComponent(String(docId)) + '?includeTabsContent=true';
+  const headers = {
+    Authorization: 'Bearer ' + ScriptApp.getOAuthToken(),
+    Accept: 'application/json'
+  };
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: headers,
+    muteHttpExceptions: true,
+  });
+
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch (e) {
+    throw new Error('Docs API returned invalid JSON (HTTP ' + code + ')');
   }
 
+  if (code < 200 || code >= 300) {
+    const msg = (json && json.error && json.error.message) ? json.error.message : (text || 'Docs API error');
+    log_('docs.rest.error', { docId: String(docId), code: code, msg: String(msg).slice(0, 300), ms: Date.now() - started });
+    throw new Error('Failed to read tabs via Docs API: ' + msg + ' (HTTP ' + code + ')');
+  }
+
+  log_('docs.rest.ok', { docId: String(docId), ms: Date.now() - started });
+  return json;
+}
+
+function flattenTabs_(tabs, out) {
+  const arr = Array.isArray(tabs) ? tabs : [];
+  for (const t of arr) {
+    if (!t) continue;
+    out.push(t);
+    // Some docs may have nested/child tabs.
+    if (Array.isArray(t.childTabs) && t.childTabs.length) {
+      flattenTabs_(t.childTabs, out);
+    }
+  }
+}
+
+function extractTextFromStructuralElements_(elements, outPieces) {
+  const els = Array.isArray(elements) ? elements : [];
+  for (const el of els) {
+    if (!el) continue;
+
+    if (el.paragraph && Array.isArray(el.paragraph.elements)) {
+      for (const pe of el.paragraph.elements) {
+        const tr = pe && pe.textRun;
+        if (tr && typeof tr.content === 'string') {
+          outPieces.push(tr.content);
+        }
+      }
+      continue;
+    }
+
+    if (el.table && Array.isArray(el.table.tableRows)) {
+      for (const row of el.table.tableRows) {
+        const cells = row && Array.isArray(row.tableCells) ? row.tableCells : [];
+        for (const cell of cells) {
+          extractTextFromStructuralElements_(cell && cell.content ? cell.content : [], outPieces);
+        }
+      }
+      continue;
+    }
+
+    if (el.tableOfContents && Array.isArray(el.tableOfContents.content)) {
+      extractTextFromStructuralElements_(el.tableOfContents.content, outPieces);
+      continue;
+    }
+  }
+}
+
+function getTabsWithTextForActiveDocument_() {
+  const doc = DocumentApp.getActiveDocument();
+  const docId = doc.getId();
+  const d = fetchDocsDocumentRest_(docId);
+  const flat = [];
+  flattenTabs_(d && d.tabs ? d.tabs : [], flat);
+
+  const results = [];
+  for (const t of flat) {
+    const props = t && t.tabProperties ? t.tabProperties : {};
+    const tabId = props && props.tabId ? String(props.tabId) : '';
+    if (!tabId) continue;
+
+    const title = props && props.title ? String(props.title) : '';
+    const body = t && t.documentTab && t.documentTab.body ? t.documentTab.body : null;
+    const pieces = [];
+    extractTextFromStructuralElements_(body && body.content ? body.content : [], pieces);
+    const text = pieces.join('').replace(/\r\n/g, '\n');
+
+    results.push({ tabId: tabId, title: title, text: text });
+  }
+
+  return results;
+}
+
+function getActiveTabIdBestEffort_(doc) {
+  try {
+    if (doc && typeof doc.getActiveTab === 'function') {
+      const t = doc.getActiveTab();
+      if (t && typeof t.getId === 'function') return String(t.getId());
+      if (t && typeof t.getTabId === 'function') return String(t.getTabId());
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    if (doc && typeof doc.getTabs === 'function') {
+      const tabs = doc.getTabs();
+      if (tabs && tabs.length) {
+        for (const t of tabs) {
+          try {
+            const selected = (t && typeof t.isSelected === 'function') ? t.isSelected() : false;
+            if (selected) {
+              if (t && typeof t.getId === 'function') return String(t.getId());
+              if (t && typeof t.getTabId === 'function') return String(t.getTabId());
+            }
+          } catch (err) {
+            // ignore
+          }
+        }
+      }
+    }
+  } catch (e2) {
+    // ignore
+  }
+
+  return '';
+}
+
+function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge, tabIdOverride) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
   ensureV2Session_(instructions);
 
-  const resp = callBackendV2_('/v2/sync-doc', {
+  const tabs = getTabsWithTextForActiveDocument_();
+  if (!tabs.length) {
+    // Fallback to legacy behavior (best-effort).
+    const legacy = doc.getBody().getText();
+    if (!legacy || !legacy.trim()) {
+      log_('v2.sync_tab.empty', { docId: doc.getId(), mode: 'legacy_fallback' });
+      throw new Error('This tab is empty.');
+    }
+
+    const respLegacy = callBackendV2_('/v2/sync-doc', {
+      docId: doc.getId(),
+      docTitle: doc.getName(),
+      docText: legacy,
+      instructions: instructions,
+      replaceKnowledge: Boolean(replaceKnowledge)
+    });
+
+    log_('v2.sync_doc.legacy', {
+      docId: doc.getId(),
+      docTitle: doc.getName(),
+      docTextLen: String(legacy || '').length,
+      instructionsLen: String(instructions || '').length,
+      replaceKnowledge: Boolean(replaceKnowledge),
+      reused: Boolean(respLegacy && respLegacy.reused),
+      ms: Date.now() - started
+    });
+
+    return respLegacy;
+  }
+
+  const activeTabId = getActiveTabIdBestEffort_(doc);
+  const docProps = PropertiesService.getDocumentProperties();
+  const storedTabId = docProps.getProperty('DOCASSIST_SELECTED_TAB_ID') || '';
+  const requestedTabId = String((typeof tabIdOverride === 'string' ? tabIdOverride : '') || storedTabId || '').trim();
+
+  const chosen =
+    (requestedTabId && tabs.find(t => t.tabId === requestedTabId))
+      ? tabs.find(t => t.tabId === requestedTabId)
+      : ((activeTabId && tabs.find(t => t.tabId === activeTabId))
+          ? tabs.find(t => t.tabId === activeTabId)
+          : tabs[0]);
+
+  const tabText = chosen && chosen.text ? String(chosen.text) : '';
+  if (!tabText || !tabText.trim()) {
+    log_('v2.sync_tab.empty', { docId: doc.getId(), tabId: chosen ? chosen.tabId : '', activeTabId: activeTabId });
+    throw new Error('This tab is empty.');
+  }
+
+  const resp = callBackendV2_('/v2/sync-tab', {
     docId: doc.getId(),
-    docTitle: doc.getName(),
-    docText: docText,
+    tabId: chosen.tabId,
+    tabTitle: chosen.title || '',
+    tabText: tabText,
     instructions: instructions,
     replaceKnowledge: Boolean(replaceKnowledge)
   });
 
-  log_('v2.sync_doc', {
+  log_('v2.sync_tab', {
     docId: doc.getId(),
-    docTitle: doc.getName(),
-    docTextLen: String(docText || '').length,
+    tabId: chosen.tabId,
+    tabTitle: chosen.title || '',
+    tabTextLen: String(tabText || '').length,
     instructionsLen: String(instructions || '').length,
     replaceKnowledge: Boolean(replaceKnowledge),
     reused: Boolean(resp && resp.reused),
+    activeTabId: activeTabId,
+    requestedTabId: requestedTabId,
+    usedFallbackFirstTab: Boolean(!requestedTabId && (!activeTabId || activeTabId !== chosen.tabId)),
     ms: Date.now() - started
   });
 
   return resp;
+}
+
+function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+  const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
+  ensureV2Session_(instructions);
+
+  const tabs = getTabsWithTextForActiveDocument_();
+  if (!tabs.length) {
+    throw new Error('No tabs found (Docs API did not return tabs).');
+  }
+
+  let replaceApplied = false;
+  let synced = 0;
+  let skippedEmpty = 0;
+
+  for (const t of tabs) {
+    const text = t && t.text ? String(t.text) : '';
+    if (!text || !text.trim()) {
+      skippedEmpty += 1;
+      continue;
+    }
+
+    const rk = Boolean(replaceKnowledge) && !replaceApplied;
+    const resp = callBackendV2_('/v2/sync-tab', {
+      docId: doc.getId(),
+      tabId: String(t.tabId),
+      tabTitle: t.title || '',
+      tabText: text,
+      instructions: instructions,
+      replaceKnowledge: rk
+    });
+
+    synced += 1;
+    if (rk) replaceApplied = true;
+
+    log_('v2.sync_tab.batch_item', {
+      docId: doc.getId(),
+      tabId: String(t.tabId),
+      tabTitle: t.title || '',
+      tabTextLen: String(text || '').length,
+      replaceKnowledge: rk,
+      reused: Boolean(resp && resp.reused)
+    });
+  }
+
+  log_('v2.sync_tab.batch', {
+    docId: doc.getId(),
+    tabsTotal: tabs.length,
+    synced: synced,
+    skippedEmpty: skippedEmpty,
+    replaceKnowledgeRequested: Boolean(replaceKnowledge),
+    replaceApplied: replaceApplied,
+    ms: Date.now() - started
+  });
+
+  return { ok: true, tabsTotal: tabs.length, synced: synced, skippedEmpty: skippedEmpty };
 }
 
 function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOverride, replaceKnowledge) {
