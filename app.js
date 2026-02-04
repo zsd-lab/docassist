@@ -1427,6 +1427,14 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         return s === "1" || s === "true" || s === "yes" || s === "on";
       })();
 
+      const fileScopeEnabled = (() => {
+        if (req.body.fileScope == null) return true;
+        const v = req.body.fileScope;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        return !(s === "0" || s === "false" || s === "no" || s === "off");
+      })();
+
       const session = await getOrCreateSession(
         String(docId),
         typeof instructions === "string" ? instructions : ""
@@ -1460,11 +1468,14 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       }
 
       // Create a per-file vector store for file-scoped chat.
-      const fileVectorStore = await client.vectorStores.create({
-        name: `docassist-${String(docId)}-doc-${docHash.slice(0, 12)}`,
-        metadata: { doc_id: String(docId), kind: "doc", sha256: docHash },
-      });
-      const fileVectorStoreId = fileVectorStore?.id;
+      let fileVectorStoreId = null;
+      if (fileScopeEnabled) {
+        const fileVectorStore = await client.vectorStores.create({
+          name: `docassist-${String(docId)}-doc-${docHash.slice(0, 12)}`,
+          metadata: { doc_id: String(docId), kind: "doc", sha256: docHash },
+        });
+        fileVectorStoreId = fileVectorStore?.id;
+      }
 
       const chunks = cfg.chunkingEnabled
         ? buildChunksFromStructuredText(formatted, {
@@ -1510,16 +1521,19 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
           docVsfId = vsFile.id;
         }
 
-        const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
-          type: "text/plain",
-        });
-        const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-          fileVectorStoreId,
-          uploadableFileScope
-        );
+        let fileScopeVsf = null;
+        if (fileScopeEnabled && fileVectorStoreId) {
+          const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+            type: "text/plain",
+          });
+          fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+            fileVectorStoreId,
+            uploadableFileScope
+          );
+        }
 
         await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
-          fileVectorStoreId,
+          fileVectorStoreId: fileVectorStoreId,
           fileVectorStoreFileId: fileScopeVsf?.id || null,
         });
 
@@ -1534,7 +1548,7 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       }
 
       await recordVectorStoreFile(String(docId), "doc", docEntryFilename, docHash, firstDocVsfId, {
-        fileVectorStoreId,
+        fileVectorStoreId: fileVectorStoreId,
         fileVectorStoreFileId: firstFileScopeVsfId,
       });
 
@@ -1614,6 +1628,14 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         return s === "1" || s === "true" || s === "yes" || s === "on";
       })();
 
+      const fileScopeEnabled = (() => {
+        if (req.body.fileScope == null) return true;
+        const v = req.body.fileScope;
+        if (typeof v === "boolean") return v;
+        const s = String(v).trim().toLowerCase();
+        return !(s === "0" || s === "false" || s === "no" || s === "off");
+      })();
+
       const session = await getOrCreateSession(
         String(docId),
         typeof instructions === "string" ? instructions : ""
@@ -1654,11 +1676,14 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         }
       }
 
-      const fileVectorStore = await client.vectorStores.create({
-        name: `docassist-${String(docId)}-tab-${tabHash.slice(0, 12)}`,
-        metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: tabHash },
-      });
-      const fileVectorStoreId = fileVectorStore?.id;
+      let fileVectorStoreId = null;
+      if (fileScopeEnabled) {
+        const fileVectorStore = await client.vectorStores.create({
+          name: `docassist-${String(docId)}-tab-${tabHash.slice(0, 12)}`,
+          metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: tabHash },
+        });
+        fileVectorStoreId = fileVectorStore?.id;
+      }
 
       const chunks = cfg.chunkingEnabled
         ? buildChunksFromStructuredText(formatted, {
@@ -1704,16 +1729,19 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
           docVsfId = vsFile.id;
         }
 
-        const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
-          type: "text/plain",
-        });
-        const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-          fileVectorStoreId,
-          uploadableFileScope
-        );
+        let fileScopeVsf = null;
+        if (fileScopeEnabled && fileVectorStoreId) {
+          const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+            type: "text/plain",
+          });
+          fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+            fileVectorStoreId,
+            uploadableFileScope
+          );
+        }
 
         await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
-          fileVectorStoreId,
+          fileVectorStoreId: fileVectorStoreId,
           fileVectorStoreFileId: fileScopeVsf?.id || null,
         });
 
@@ -1728,7 +1756,7 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       }
 
       await recordVectorStoreFile(String(docId), "tab", tabEntryFilename, tabHash, firstDocVsfId, {
-        fileVectorStoreId,
+        fileVectorStoreId: fileVectorStoreId,
         fileVectorStoreFileId: firstFileScopeVsfId,
       });
 

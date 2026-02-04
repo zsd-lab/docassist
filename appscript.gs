@@ -237,6 +237,10 @@ function getChatSidebarHtml_() {
         </select>
       </label>
       <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
+        <input id="fileScopeIndex" type="checkbox" checked />
+        File-scope index
+      </label>
+      <label style="display:flex; align-items:center; gap:6px; font-weight:400;">
         <input id="autoSync" type="checkbox" />
         Auto-sync before sending
       </label>
@@ -787,7 +791,12 @@ function getChatSidebarHtml_() {
         }).withFailureHandler((err) => {
           setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
           disableAll(false);
-        }).syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked), el('tabPicker') ? el('tabPicker').value : '');
+        }).syncDocumentToKnowledge(
+          el('instructions').value,
+          Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked),
+          el('tabPicker') ? el('tabPicker').value : '',
+          Boolean(el('fileScopeIndex') && el('fileScopeIndex').checked)
+        );
       });
 
       el('syncAllBtn').addEventListener('click', () => {
@@ -800,7 +809,11 @@ function getChatSidebarHtml_() {
         }).withFailureHandler((err) => {
           setStatus('Error syncing tabs: ' + (err && err.message ? err.message : err));
           disableAll(false);
-        }).syncAllTabsToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
+        }).syncAllTabsToKnowledge(
+          el('instructions').value,
+          Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked),
+          Boolean(el('fileScopeIndex') && el('fileScopeIndex').checked)
+        );
       });
 
       el('uploadBtn').addEventListener('click', async () => {
@@ -875,7 +888,12 @@ function getChatSidebarHtml_() {
               setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
               disableAll(false);
             })
-            .syncDocumentToKnowledge(el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked), el('tabPicker') ? el('tabPicker').value : '');
+            .syncDocumentToKnowledge(
+              el('instructions').value,
+              Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked),
+              el('tabPicker') ? el('tabPicker').value : '',
+              Boolean(el('fileScopeIndex') && el('fileScopeIndex').checked)
+            );
         } else {
           doSend();
         }
@@ -1348,7 +1366,7 @@ function getActiveTabIdBestEffort_(doc) {
   return '';
 }
 
-function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge, tabIdOverride) {
+function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge, tabIdOverride, fileScopeEnabled) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
@@ -1408,7 +1426,8 @@ function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge, tabIdOv
     tabTitle: chosen.title || '',
     tabText: tabText,
     instructions: instructions,
-    replaceKnowledge: Boolean(replaceKnowledge)
+    replaceKnowledge: Boolean(replaceKnowledge),
+    fileScope: Boolean(fileScopeEnabled)
   });
 
   log_('v2.sync_tab', {
@@ -1428,7 +1447,7 @@ function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge, tabIdOv
   return resp;
 }
 
-function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge) {
+function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge, fileScopeEnabled) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
   const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
@@ -1457,7 +1476,8 @@ function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge) {
       tabTitle: t.title || '',
       tabText: text,
       instructions: instructions,
-      replaceKnowledge: rk
+      replaceKnowledge: rk,
+      fileScope: Boolean(fileScopeEnabled)
     });
 
     synced += 1;
