@@ -881,6 +881,46 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     return Array.from(out);
   }
 
+  async function bestEffortListVectorStoreFiles_({ vectorStoreId }) {
+    if (!vectorStoreId) return { vectorStoreFileIds: [], fileIds: [] };
+    const filesApi = client?.vectorStores?.files;
+    if (!filesApi || typeof filesApi.list !== "function") {
+      return { vectorStoreFileIds: [], fileIds: [] };
+    }
+
+    const vectorStoreFileIds = new Set();
+    const fileIds = new Set();
+    let after = undefined;
+    let hasMore = true;
+
+    while (hasMore) {
+      try {
+        const resp = await filesApi.list(vectorStoreId, { limit: 100, after });
+        const data = Array.isArray(resp?.data) ? resp.data : [];
+        for (const item of data) {
+          const vsFileId = item?.id || item?.vector_store_file_id || item?.vectorStoreFileId;
+          if (vsFileId) vectorStoreFileIds.add(String(vsFileId));
+          const fileId = item?.file_id || item?.fileId || item?.file?.id;
+          if (fileId) fileIds.add(String(fileId));
+        }
+
+        hasMore = Boolean(resp?.has_more);
+        if (hasMore) {
+          const last = data.length ? (data[data.length - 1]?.id || data[data.length - 1]?.vector_store_file_id) : null;
+          after = last || after;
+          if (!after) hasMore = false;
+        }
+      } catch (_) {
+        break;
+      }
+    }
+
+    return {
+      vectorStoreFileIds: Array.from(vectorStoreFileIds),
+      fileIds: Array.from(fileIds),
+    };
+  }
+
   async function bestEffortCleanupOpenAIForDoc_({ docId }) {
     const result = {
       docId: String(docId),
@@ -934,44 +974,32 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
 
     // Delete vector store files in the doc store.
     if (vectorStoreId && client?.vectorStores?.files) {
-      result.attempted.docVectorStoreFiles = docVsFileIds.length;
-      for (const fileId of docVsFileIds) {
-        try {
-          const filesApi = client.vectorStores.files;
-          if (typeof filesApi.del === "function") {
-            await filesApi.del(vectorStoreId, fileId);
-            result.deleted.docVectorStoreFiles += 1;
-          } else if (typeof filesApi.delete === "function") {
-            await filesApi.delete(vectorStoreId, fileId);
-            result.deleted.docVectorStoreFiles += 1;
-          }
-        } catch (_) {
-          // best-effort
-        }
-      }
+      const listed = await bestEffortListVectorStoreFiles_({ vectorStoreId });
+      const docVsFileIdsAll = Array.from(new Set([...docVsFileIds, ...listed.vectorStoreFileIds]));
+      listed.fileIds.forEach((id) => openaiFileIds.add(id));
+
+      const delRes = await bestEffortDeleteVectorStoreFilesByIds_({
+        vectorStoreId,
+        fileIds: docVsFileIdsAll,
+      });
+      result.attempted.docVectorStoreFiles = delRes.attempted;
+      result.deleted.docVectorStoreFiles = delRes.deleted;
     }
 
     // Delete file-scoped vector stores (and their files).
     if (client?.vectorStores) {
       for (const vsId of fileVsIds) {
-        const vsFileIds = fileVsFileIdsByStore.get(vsId) || [];
-        result.attempted.fileVectorStoreFiles += vsFileIds.length;
-        if (vsFileIds.length && client?.vectorStores?.files) {
-          for (const fileId of vsFileIds) {
-            try {
-              const filesApi = client.vectorStores.files;
-              if (typeof filesApi.del === "function") {
-                await filesApi.del(vsId, fileId);
-                result.deleted.fileVectorStoreFiles += 1;
-              } else if (typeof filesApi.delete === "function") {
-                await filesApi.delete(vsId, fileId);
-                result.deleted.fileVectorStoreFiles += 1;
-              }
-            } catch (_) {
-              // best-effort
-            }
-          }
-        }
+        const knownVsFileIds = fileVsFileIdsByStore.get(vsId) || [];
+        const listed = await bestEffortListVectorStoreFiles_({ vectorStoreId: vsId });
+        const vsFileIdsAll = Array.from(new Set([...knownVsFileIds, ...listed.vectorStoreFileIds]));
+        listed.fileIds.forEach((id) => openaiFileIds.add(id));
+
+        const delRes = await bestEffortDeleteVectorStoreFilesByIds_({
+          vectorStoreId: vsId,
+          fileIds: vsFileIdsAll,
+        });
+        result.attempted.fileVectorStoreFiles += delRes.attempted;
+        result.deleted.fileVectorStoreFiles += delRes.deleted;
 
         try {
           if (typeof client.vectorStores.del === "function") {
