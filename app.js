@@ -779,6 +779,139 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     return { attempted: ids.length, deleted, failed, deletedIds };
   }
 
+  async function bestEffortCleanupOpenAIForDoc_({ docId }) {
+    const result = {
+      docId: String(docId),
+      deleted: {
+        docVectorStoreFiles: 0,
+        fileVectorStoreFiles: 0,
+        fileVectorStores: 0,
+        docVectorStore: 0,
+        conversation: 0,
+      },
+      attempted: {
+        docVectorStoreFiles: 0,
+        fileVectorStoreFiles: 0,
+        fileVectorStores: 0,
+      },
+    };
+
+    const s = await pool.query(
+      `SELECT conversation_id, vector_store_id FROM docs_sessions WHERE doc_id = $1`,
+      [String(docId)]
+    );
+    const row = s.rows?.[0];
+
+    const f = await pool.query(
+      `SELECT vector_store_file_id, file_vector_store_id, file_vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
+      [String(docId)]
+    );
+    const docVsFileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
+    const fileVsIds = Array.from(
+      new Set((f.rows || []).map((r) => r.file_vector_store_id).filter(Boolean))
+    );
+    const fileVsFileIdsByStore = new Map();
+    for (const row of f.rows || []) {
+      const vsId = row.file_vector_store_id;
+      const vsFileId = row.file_vector_store_file_id;
+      if (!vsId || !vsFileId) continue;
+      const arr = fileVsFileIdsByStore.get(vsId) || [];
+      arr.push(vsFileId);
+      fileVsFileIdsByStore.set(vsId, arr);
+    }
+
+    const conversationId = row?.conversation_id;
+    const vectorStoreId = row?.vector_store_id;
+
+    // Delete vector store files in the doc store.
+    if (vectorStoreId && client?.vectorStores?.files) {
+      result.attempted.docVectorStoreFiles = docVsFileIds.length;
+      for (const fileId of docVsFileIds) {
+        try {
+          const filesApi = client.vectorStores.files;
+          if (typeof filesApi.del === "function") {
+            await filesApi.del(vectorStoreId, fileId);
+            result.deleted.docVectorStoreFiles += 1;
+          } else if (typeof filesApi.delete === "function") {
+            await filesApi.delete(vectorStoreId, fileId);
+            result.deleted.docVectorStoreFiles += 1;
+          }
+        } catch (_) {
+          // best-effort
+        }
+      }
+    }
+
+    // Delete file-scoped vector stores (and their files).
+    if (client?.vectorStores) {
+      for (const vsId of fileVsIds) {
+        const vsFileIds = fileVsFileIdsByStore.get(vsId) || [];
+        result.attempted.fileVectorStoreFiles += vsFileIds.length;
+        if (vsFileIds.length && client?.vectorStores?.files) {
+          for (const fileId of vsFileIds) {
+            try {
+              const filesApi = client.vectorStores.files;
+              if (typeof filesApi.del === "function") {
+                await filesApi.del(vsId, fileId);
+                result.deleted.fileVectorStoreFiles += 1;
+              } else if (typeof filesApi.delete === "function") {
+                await filesApi.delete(vsId, fileId);
+                result.deleted.fileVectorStoreFiles += 1;
+              }
+            } catch (_) {
+              // best-effort
+            }
+          }
+        }
+
+        try {
+          if (typeof client.vectorStores.del === "function") {
+            await client.vectorStores.del(vsId);
+            result.deleted.fileVectorStores += 1;
+          } else if (typeof client.vectorStores.delete === "function") {
+            await client.vectorStores.delete(vsId);
+            result.deleted.fileVectorStores += 1;
+          }
+        } catch (_) {
+          // best-effort
+        }
+      }
+      result.attempted.fileVectorStores = fileVsIds.length;
+    }
+
+    // Delete doc vector store container.
+    if (vectorStoreId && client?.vectorStores) {
+      try {
+        if (typeof client.vectorStores.del === "function") {
+          await client.vectorStores.del(vectorStoreId);
+          result.deleted.docVectorStore += 1;
+        } else if (typeof client.vectorStores.delete === "function") {
+          await client.vectorStores.delete(vectorStoreId);
+          result.deleted.docVectorStore += 1;
+        }
+      } catch (_) {
+        // best-effort
+      }
+    }
+
+    // Delete conversation.
+    if (conversationId && client?.conversations) {
+      try {
+        if (typeof client.conversations.del === "function") {
+          await client.conversations.del(conversationId);
+          result.deleted.conversation += 1;
+        } else if (typeof client.conversations.delete === "function") {
+          await client.conversations.delete(conversationId);
+          result.deleted.conversation += 1;
+        }
+      } catch (_) {
+        // best-effort
+      }
+    }
+
+    return result;
+  }
+
   async function bestEffortReplaceKnowledgeForDoc_({ docId, vectorStoreId }) {
     // Delete prior vector store files we know about for this doc, then delete corresponding rows.
     // Note: if older files exist in the vector store but aren't present in docs_files, we can't remove them here.
@@ -1112,106 +1245,7 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       // Optional best-effort OpenAI cleanup (off by default).
       if (cleanupOpenAI) {
         try {
-          const s = await pool.query(
-            `SELECT conversation_id, vector_store_id FROM docs_sessions WHERE doc_id = $1`,
-            [docId]
-          );
-          const row = s.rows?.[0];
-
-          const f = await pool.query(
-            `SELECT vector_store_file_id, file_vector_store_id, file_vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
-            [docId]
-          );
-          const docVsFileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
-          const fileVsIds = Array.from(
-            new Set((f.rows || []).map((r) => r.file_vector_store_id).filter(Boolean))
-          );
-          const fileVsFileIdsByStore = new Map();
-          for (const row of f.rows || []) {
-            const vsId = row.file_vector_store_id;
-            const vsFileId = row.file_vector_store_file_id;
-            if (!vsId || !vsFileId) continue;
-            const arr = fileVsFileIdsByStore.get(vsId) || [];
-            arr.push(vsFileId);
-            fileVsFileIdsByStore.set(vsId, arr);
-          }
-
-          const conversationId = row?.conversation_id;
-          const vectorStoreId = row?.vector_store_id;
-
-          // Try deleting vector store files first.
-          if (vectorStoreId && client?.vectorStores?.files) {
-            for (const fileId of docVsFileIds) {
-              try {
-                const filesApi = client.vectorStores.files;
-                if (typeof filesApi.del === "function") {
-                  await filesApi.del(vectorStoreId, fileId);
-                } else if (typeof filesApi.delete === "function") {
-                  await filesApi.delete(vectorStoreId, fileId);
-                }
-              } catch (_) {
-                // best-effort
-              }
-            }
-          }
-
-          // Delete file-scoped vector stores (best-effort).
-          if (client?.vectorStores) {
-            for (const vsId of fileVsIds) {
-              // Try deleting the store files first (if we have them).
-              const vsFileIds = fileVsFileIdsByStore.get(vsId) || [];
-              if (vsFileIds.length && client?.vectorStores?.files) {
-                for (const fileId of vsFileIds) {
-                  try {
-                    const filesApi = client.vectorStores.files;
-                    if (typeof filesApi.del === "function") {
-                      await filesApi.del(vsId, fileId);
-                    } else if (typeof filesApi.delete === "function") {
-                      await filesApi.delete(vsId, fileId);
-                    }
-                  } catch (_) {
-                    // best-effort
-                  }
-                }
-              }
-
-              try {
-                if (typeof client.vectorStores.del === "function") {
-                  await client.vectorStores.del(vsId);
-                } else if (typeof client.vectorStores.delete === "function") {
-                  await client.vectorStores.delete(vsId);
-                }
-              } catch (_) {
-                // best-effort
-              }
-            }
-          }
-
-          // Delete vector store container.
-          if (vectorStoreId && client?.vectorStores) {
-            try {
-              if (typeof client.vectorStores.del === "function") {
-                await client.vectorStores.del(vectorStoreId);
-              } else if (typeof client.vectorStores.delete === "function") {
-                await client.vectorStores.delete(vectorStoreId);
-              }
-            } catch (_) {
-              // best-effort
-            }
-          }
-
-          // Delete conversation.
-          if (conversationId && client?.conversations) {
-            try {
-              if (typeof client.conversations.del === "function") {
-                await client.conversations.del(conversationId);
-              } else if (typeof client.conversations.delete === "function") {
-                await client.conversations.delete(conversationId);
-              }
-            } catch (_) {
-              // best-effort
-            }
-          }
+          await bestEffortCleanupOpenAIForDoc_({ docId: String(docId) });
         } catch (_) {
           // best-effort
         }
@@ -1277,6 +1311,27 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
           hasFileScope: Boolean(r.file_vector_store_id),
         })),
       });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  // ====== V2 CLEANUP OPENAI ======
+  // Deletes OpenAI vector stores/files and conversation for a doc (best-effort), without deleting DB rows.
+  app.post("/v2/cleanup-openai", async (req, res) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const docId = requireNonEmptyTrimmedString(req, res, "docId", req.body.docId, {
+        maxChars: cfg.maxDocIdChars,
+      });
+      if (docId == null) return;
+
+      const result = await bestEffortCleanupOpenAIForDoc_({ docId: String(docId) });
+      return res.json({ ok: true, ...result });
     } catch (err) {
       logger.error(err);
       return res.status(500).json(jsonError(req, "Server error"));

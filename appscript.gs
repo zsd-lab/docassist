@@ -314,8 +314,10 @@ function getChatSidebarHtml_() {
             <label>Reset server state</label>
             <div class="controls" style="margin-top:6px;">
               <button id="resetServerBtn">Reset Server State</button>
+              <button id="cleanupOpenaiBtn">Cleanup OpenAI Files</button>
             </div>
             <div class="small">Deletes server-side v2 session/history for this doc.</div>
+            <div class="small">Cleanup OpenAI Files deletes OpenAI vector stores/files for this doc (best-effort).</div>
           </div>
         </div>
       </details>
@@ -554,7 +556,7 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','resetServerBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
+        ['saveSettingsBtn','resetServerBtn','cleanupOpenaiBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
           try { el(id).disabled = disabled; } catch (e) {}
         });
       }
@@ -768,6 +770,28 @@ function getChatSidebarHtml_() {
       }
 
       el('resetServerBtn').addEventListener('click', () => resetServerState_());
+
+      function cleanupOpenAI_() {
+        const ok = window.confirm('Delete OpenAI vector stores/files for this doc? This does NOT delete your Google Doc content.');
+        if (!ok) return;
+
+        disableAll(true);
+        setStatus('Cleaning up OpenAI files...');
+
+        google.script.run
+          .withSuccessHandler((resp) => {
+            const deleted = resp && resp.deleted ? resp.deleted : {};
+            setStatus('OpenAI cleanup done. Deleted stores: ' + (deleted.fileVectorStores || 0));
+            disableAll(false);
+          })
+          .withFailureHandler((err) => {
+            setStatus('OpenAI cleanup failed: ' + (err && err.message ? err.message : err));
+            disableAll(false);
+          })
+          .cleanupOpenAIForThisDocument();
+      }
+
+      el('cleanupOpenaiBtn').addEventListener('click', () => cleanupOpenAI_());
 
       el('saveInstrBtn').addEventListener('click', () => {
         disableAll(true);
@@ -1134,6 +1158,23 @@ function resetServerStateForThisDocument() {
   });
 
   log_('v2.reset_doc', {
+    docId: doc.getId(),
+    deleted: resp && resp.deleted ? resp.deleted : {},
+    ms: Date.now() - started,
+  });
+
+  return resp;
+}
+
+function cleanupOpenAIForThisDocument() {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+
+  const resp = callBackendV2_('/v2/cleanup-openai', {
+    docId: doc.getId(),
+  });
+
+  log_('v2.cleanup_openai', {
     docId: doc.getId(),
     deleted: resp && resp.deleted ? resp.deleted : {},
     ms: Date.now() - started,
