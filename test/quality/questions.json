@@ -1,0 +1,37 @@
+{
+  "docId": "YOUR_DOC_ID",
+  "questions": [
+    { "id": "q01", "text": "Summarize the main goals described in the document.", "expectSources": true },
+    { "id": "q02", "text": "What decisions were made about timeline or milestones?", "expectSources": true },
+    { "id": "q03", "text": "List the open questions mentioned so far.", "expectSources": true },
+    { "id": "q04", "text": "What risks are documented and how are they mitigated?", "expectSources": true },
+    { "id": "q05", "text": "Extract any glossary terms and their definitions.", "expectSources": true },
+    { "id": "q06", "text": "Which stakeholders are mentioned and what are their roles?", "expectSources": true },
+    { "id": "q07", "text": "Provide a short action plan based on the current document content.", "expectSources": true },
+    { "id": "q08", "text": "Compare two options discussed in the doc and recommend one.", "expectSources": true },
+    { "id": "q09", "text": "What is the current status and next steps?", "expectSources": true },
+    { "id": "q10", "text": "Give a brief overview of the document structure (sections).", "expectSources": true },
+
+    { "id": "q11", "text": "Rewrite the last paragraph in a more concise style.", "expectSources": true },
+    { "id": "q12", "text": "What dependencies are listed?", "expectSources": true },
+    { "id": "q13", "text": "Identify any contradictions or inconsistencies.", "expectSources": true },
+    { "id": "q14", "text": "What KPIs or metrics are mentioned?", "expectSources": true },
+    { "id": "q15", "text": "Draft an executive summary based strictly on the document.", "expectSources": true },
+    { "id": "q16", "text": "Find the section about roles and responsibilities.", "expectSources": true },
+    { "id": "q17", "text": "What are the key constraints stated?", "expectSources": true },
+    { "id": "q18", "text": "List any timelines or dates mentioned.", "expectSources": true },
+    { "id": "q19", "text": "Which tools or systems are referenced?", "expectSources": true },
+    { "id": "q20", "text": "Provide a one‑page meeting brief from the document.", "expectSources": true },
+
+    { "id": "q21", "text": "Suggest a checklist based on the documented process.", "expectSources": true },
+    { "id": "q22", "text": "Extract the definition of done if present.", "expectSources": true },
+    { "id": "q23", "text": "Summarize the latest decisions and rationale.", "expectSources": true },
+    { "id": "q24", "text": "What assumptions are explicitly stated?", "expectSources": true },
+    { "id": "q25", "text": "Propose a risk register using only the documented risks.", "expectSources": true },
+    { "id": "q26", "text": "How is success measured according to the document?", "expectSources": true },
+    { "id": "q27", "text": "List the main deliverables and their owners.", "expectSources": true },
+    { "id": "q28", "text": "Extract any decisions about budget or resources.", "expectSources": true },
+    { "id": "q29", "text": "What are the unresolved questions the doc hints at?", "expectSources": true },
+    { "id": "q30", "text": "Provide a short FAQ based on the document.", "expectSources": true }
+  ]
+}

@@ -525,6 +525,30 @@ function getChatSidebarHtml_() {
         el('chat').scrollTop = el('chat').scrollHeight;
       }
 
+      function addSources_(sources) {
+        const list = Array.isArray(sources) ? sources : [];
+        if (!list.length) return;
+        const div = document.createElement('div');
+        div.className = 'msg';
+        const roleSpan = document.createElement('span');
+        roleSpan.className = 'role';
+        roleSpan.textContent = 'Sources:';
+        const textSpan = document.createElement('span');
+
+        const lines = list.map((s) => {
+          const name = s && s.filename ? String(s.filename) : '(source)';
+          const section = s && s.section ? (' — ' + String(s.section)) : '';
+          const snippet = s && s.snippet ? (' — "' + String(s.snippet) + '"') : '';
+          return '• ' + name + section + snippet;
+        });
+        textSpan.innerHTML = escapeHtml(lines.join('\n')).replace(/\n/g, '<br/>');
+
+        div.appendChild(roleSpan);
+        div.appendChild(textSpan);
+        el('chat').appendChild(div);
+        el('chat').scrollTop = el('chat').scrollHeight;
+      }
+
       function disableAll(disabled) {
         ['saveSettingsBtn','resetServerBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
           try { el(id).disabled = disabled; } catch (e) {}
@@ -818,14 +842,19 @@ function getChatSidebarHtml_() {
 
         const doSend = () => {
           setStatus('Thinking...');
-          google.script.run.withSuccessHandler((reply) => {
-            addMsg('Assistant', reply || '(empty)');
+          google.script.run.withSuccessHandler((resp) => {
+            const replyText = (resp && typeof resp.reply !== 'undefined') ? resp.reply : resp;
+            addMsg('Assistant', replyText || '(empty)');
+
+            if (resp && resp.sources && Array.isArray(resp.sources) && resp.sources.length) {
+              addSources_(resp.sources);
+            }
 
             if (el('autoAppend') && el('autoAppend').checked) {
               try {
                 google.script.run
                   .withFailureHandler(() => { /* best-effort */ })
-                  .appendChatTurnToDoc(text, reply || '');
+                  .appendChatTurnToDoc(text, replyText || '');
               } catch (e) {
                 // best-effort
               }
@@ -1161,33 +1190,99 @@ function flattenTabs_(tabs, out) {
   }
 }
 
-function extractTextFromStructuralElements_(elements, outPieces) {
+function extractPlainTextFromElements_(elements) {
+  const els = Array.isArray(elements) ? elements : [];
+  const out = [];
+  for (const el of els) {
+    if (!el) continue;
+    if (el.paragraph && Array.isArray(el.paragraph.elements)) {
+      for (const pe of el.paragraph.elements) {
+        const tr = pe && pe.textRun;
+        if (tr && typeof tr.content === 'string') {
+          out.push(tr.content);
+        }
+      }
+      continue;
+    }
+    if (el.table && Array.isArray(el.table.tableRows)) {
+      for (const row of el.table.tableRows) {
+        const cells = row && Array.isArray(row.tableCells) ? row.tableCells : [];
+        for (const cell of cells) {
+          out.push(extractPlainTextFromElements_(cell && cell.content ? cell.content : []));
+        }
+      }
+      continue;
+    }
+    if (el.tableOfContents && Array.isArray(el.tableOfContents.content)) {
+      out.push(extractPlainTextFromElements_(el.tableOfContents.content));
+      continue;
+    }
+  }
+  return out.join('').replace(/\s+/g, ' ').trim();
+}
+
+function renderTableAsMarkdown_(table, lines) {
+  const rows = table && Array.isArray(table.tableRows) ? table.tableRows : [];
+  if (!rows.length) return;
+
+  const renderedRows = rows.map((row) => {
+    const cells = row && Array.isArray(row.tableCells) ? row.tableCells : [];
+    const values = cells.map((cell) => extractPlainTextFromElements_(cell && cell.content ? cell.content : []));
+    return values;
+  });
+
+  for (let r = 0; r < renderedRows.length; r++) {
+    const vals = renderedRows[r];
+    lines.push('| ' + vals.join(' | ') + ' |');
+    if (r === 0) {
+      const sep = vals.map(() => '---').join(' | ');
+      lines.push('| ' + sep + ' |');
+    }
+  }
+  lines.push('');
+}
+
+function collectStructuralMarkdownLines_(elements, lines) {
   const els = Array.isArray(elements) ? elements : [];
   for (const el of els) {
     if (!el) continue;
 
     if (el.paragraph && Array.isArray(el.paragraph.elements)) {
-      for (const pe of el.paragraph.elements) {
-        const tr = pe && pe.textRun;
-        if (tr && typeof tr.content === 'string') {
-          outPieces.push(tr.content);
-        }
+      const para = el.paragraph;
+      const text = extractPlainTextFromElements_([{ paragraph: para }]).replace(/\s+$/g, '');
+      if (!text) continue;
+
+      const style = para.paragraphStyle && para.paragraphStyle.namedStyleType
+        ? String(para.paragraphStyle.namedStyleType)
+        : '';
+
+      if (style.indexOf('HEADING_') === 0) {
+        const lvl = Number(style.replace('HEADING_', '')) || 1;
+        const hashes = '#'.repeat(Math.min(3, Math.max(1, lvl)));
+        lines.push(hashes + ' ' + text.trim());
+        lines.push('');
+        continue;
       }
+
+      if (para.bullet) {
+        const nesting = Number(para.bullet.nestingLevel || 0);
+        const indent = '  '.repeat(Math.min(3, Math.max(0, nesting)));
+        lines.push(indent + '- ' + text.trim());
+        continue;
+      }
+
+      lines.push(text.trim());
+      lines.push('');
       continue;
     }
 
-    if (el.table && Array.isArray(el.table.tableRows)) {
-      for (const row of el.table.tableRows) {
-        const cells = row && Array.isArray(row.tableCells) ? row.tableCells : [];
-        for (const cell of cells) {
-          extractTextFromStructuralElements_(cell && cell.content ? cell.content : [], outPieces);
-        }
-      }
+    if (el.table) {
+      renderTableAsMarkdown_(el.table, lines);
       continue;
     }
 
     if (el.tableOfContents && Array.isArray(el.tableOfContents.content)) {
-      extractTextFromStructuralElements_(el.tableOfContents.content, outPieces);
+      collectStructuralMarkdownLines_(el.tableOfContents.content, lines);
       continue;
     }
   }
@@ -1208,9 +1303,9 @@ function getTabsWithTextForActiveDocument_() {
 
     const title = props && props.title ? String(props.title) : '';
     const body = t && t.documentTab && t.documentTab.body ? t.documentTab.body : null;
-    const pieces = [];
-    extractTextFromStructuralElements_(body && body.content ? body.content : [], pieces);
-    const text = pieces.join('').replace(/\r\n/g, '\n');
+    const lines = [];
+    collectStructuralMarkdownLines_(body && body.content ? body.content : [], lines);
+    const text = lines.join('\n').replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 
     results.push({ tabId: tabId, title: title, text: text });
   }
@@ -1447,7 +1542,7 @@ function sendChatMessage(userMessage, instructionsOverride, fileScopeIdOverride)
     ms: Date.now() - started
   });
 
-  return String(resp.reply || '');
+  return resp;
 }
 
 function appendChatTurnToDoc(userText, assistantText) {

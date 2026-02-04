@@ -64,6 +64,60 @@ export function createApp({
     })(),
     // Override the default system prompt (can be passed from server.js or via env var).
     systemPrompt: config?.systemPrompt ?? process.env.DOCASSIST_SYSTEM_PROMPT,
+    summaryEnabled: (() => {
+      const raw = config?.summaryEnabled ?? process.env.DOCASSIST_SUMMARY_ENABLED;
+      if (raw == null) return true;
+      const s = String(raw).trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes" || s === "on";
+    })(),
+    summaryMaxChars: (() => {
+      const raw = config?.summaryMaxChars ?? process.env.DOCASSIST_SUMMARY_MAX_CHARS;
+      if (raw == null || String(raw).trim() === "") return 1800;
+      const n = Number.parseInt(String(raw), 10);
+      return Number.isFinite(n) && n > 100 ? n : 1800;
+    })(),
+    summaryInputMaxChars: (() => {
+      const raw = config?.summaryInputMaxChars ?? process.env.DOCASSIST_SUMMARY_INPUT_MAX_CHARS;
+      if (raw == null || String(raw).trim() === "") return 20000;
+      const n = Number.parseInt(String(raw), 10);
+      return Number.isFinite(n) && n > 1000 ? n : 20000;
+    })(),
+    chunkingEnabled: (() => {
+      const raw = config?.chunkingEnabled ?? process.env.DOCASSIST_CHUNKING_ENABLED;
+      if (raw == null) return true;
+      const s = String(raw).trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes" || s === "on";
+    })(),
+    chunkMaxTokens: (() => {
+      const raw = config?.chunkMaxTokens ?? process.env.DOCASSIST_CHUNK_MAX_TOKENS;
+      if (raw == null || String(raw).trim() === "") return 700;
+      const n = Number.parseInt(String(raw), 10);
+      return Number.isFinite(n) && n > 100 ? n : 700;
+    })(),
+    chunkOverlapTokens: (() => {
+      const raw = config?.chunkOverlapTokens ?? process.env.DOCASSIST_CHUNK_OVERLAP_TOKENS;
+      if (raw == null || String(raw).trim() === "") return 150;
+      const n = Number.parseInt(String(raw), 10);
+      return Number.isFinite(n) && n >= 0 ? n : 150;
+    })(),
+    chatLogEnabled: (() => {
+      const raw = config?.chatLogEnabled ?? process.env.DOCASSIST_CHAT_LOG_ENABLED;
+      if (raw == null) return true;
+      const s = String(raw).trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes" || s === "on";
+    })(),
+    forceFileSearch: (() => {
+      const raw = config?.forceFileSearch ?? process.env.DOCASSIST_FORCE_FILE_SEARCH;
+      if (raw == null) return true;
+      const s = String(raw).trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes" || s === "on";
+    })(),
+    twoStepEnabled: (() => {
+      const raw = config?.twoStepEnabled ?? process.env.DOCASSIST_TWO_STEP_ENABLED;
+      if (raw == null) return false;
+      const s = String(raw).trim().toLowerCase();
+      return s === "1" || s === "true" || s === "yes" || s === "on";
+    })(),
   };
 
   const client = openaiClient ||
@@ -72,26 +126,7 @@ export function createApp({
     });
 
   const DEFAULT_SYSTEM_PROMPT = `
-  SZEREP
-  Te vagy Zsigó Dávid személyes stratégiai tanácsadója (agilis, stakeholder, szervezeti politika – etikus keretek között).
-
-  CÉL
-  Segíts, hogy 90 nap alatt látható üzleti/delivery eredményt, felsővezetői bizalmat és nagyobb mandátumot építsen úgy, hogy ne keltsen alárendelt benyomást.
-
-  MŰKÖDÉS
-  - Ha kevés a kontextus: tegyél fel max 3–5 célzott kérdést.
-  - Adj kézzelfogható, másnap használható javaslatot (lépések + szkriptek).
-  - Nevezz meg kockázatot/tradeoffot és adj mitigációt.
-
-  ALAP KIMENET
-  1) Mi a tét / döntési pont.
-  2) 3–5 konkrét next action (3–10 nap).
-  3) 1–2 kommunikációs szkript (1:1 / meeting / vezetői update).
-  4) Mandátum-növelő mini-megállapodás javaslat.
-  5) 2–3 mérőszám, amivel bizonyít.
-
-  STÍLUS
-  Magyarul, tegezve, tömören, strukturáltan.
+You are a helpful, concise assistant. Ask clarifying questions when needed, be factual, and keep responses structured and actionable.
 `.trim();
 
   const SYSTEM_PROMPT = String(cfg.systemPrompt ?? DEFAULT_SYSTEM_PROMPT).trim();
@@ -226,11 +261,326 @@ export function createApp({
     });
   }
 
-  function buildInstructions(customInstructions) {
+  function buildInstructions(customInstructions, docSummary) {
     const custom = String(customInstructions || "").trim();
-    if (!custom) return SYSTEM_PROMPT;
+    const summary = String(docSummary || "").trim();
 
-    return `${SYSTEM_PROMPT}\n\n---\nProject instructions (user-provided):\n${custom}`.trim();
+    if (!custom && !summary) return SYSTEM_PROMPT;
+
+    const parts = [SYSTEM_PROMPT];
+    if (summary) {
+      parts.push(`Project memory (auto-summary):\n${summary}`);
+    }
+    if (custom) {
+      parts.push(`Project instructions (user-provided):\n${custom}`);
+    }
+
+    return parts.join("\n\n---\n").trim();
+  }
+
+  function normalizeStructuredText(text) {
+    return String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function estimateTokens(text) {
+    // Rough heuristic: ~4 chars per token for English/HU mix.
+    return Math.max(1, Math.ceil(String(text || "").length / 4));
+  }
+
+  function slugifyForFilename(value, maxLen = 60) {
+    const s = String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    const trimmed = s || "section";
+    return trimmed.length > maxLen ? trimmed.slice(0, maxLen) : trimmed;
+  }
+
+  function splitStructuredTextToSections(text) {
+    const lines = String(text || "").split("\n");
+    const sections = [];
+    let path = [];
+    let current = { path: [], lines: [] };
+
+    const pushCurrent = () => {
+      if (!current.lines.length) return;
+      sections.push({
+        path: current.path.slice(),
+        text: current.lines.join("\n").trim(),
+      });
+      current = { path: path.slice(), lines: [] };
+    };
+
+    for (const line of lines) {
+      const m = line.match(/^(#{1,6})\s+(.+)$/);
+      if (m) {
+        pushCurrent();
+        const level = m[1].length;
+        const title = m[2].trim();
+        path = path.slice(0, level - 1);
+        path[level - 1] = title;
+        current = { path: path.slice(), lines: [line] };
+        continue;
+      }
+
+      current.lines.push(line);
+    }
+
+    pushCurrent();
+
+    if (!sections.length && String(text || "").trim()) {
+      sections.push({ path: [], text: String(text || "").trim() });
+    }
+
+    return sections;
+  }
+
+  function buildChunksFromStructuredText(text, { maxTokens, overlapTokens }) {
+    const normalized = normalizeStructuredText(text);
+    if (!normalized) return [];
+
+    const sections = splitStructuredTextToSections(normalized);
+    const chunks = [];
+    const overlapChars = Math.max(0, Number(overlapTokens || 0)) * 4;
+
+    for (const section of sections) {
+      const sectionPath = (section.path || []).join(" > ");
+      const header = sectionPath ? `Section: ${sectionPath}` : "Section: (no heading)";
+      const sectionText = String(section.text || "").trim();
+      if (!sectionText) continue;
+
+      const paragraphs = sectionText.split(/\n{2,}/);
+      let buffer = "";
+      const flush = () => {
+        if (!buffer.trim()) return;
+        const payload = `${header}\n\n${buffer.trim()}`;
+        chunks.push({ sectionPath, text: payload });
+        buffer = "";
+      };
+
+      for (const p of paragraphs) {
+        const candidate = buffer ? `${buffer}\n\n${p}` : p;
+        if (estimateTokens(candidate) <= maxTokens) {
+          buffer = candidate;
+          continue;
+        }
+
+        if (buffer) {
+          flush();
+          if (overlapChars > 0) {
+            const tail = candidate.slice(-overlapChars);
+            buffer = tail;
+          }
+        }
+
+        if (estimateTokens(p) > maxTokens) {
+          // Hard split long paragraph.
+          let start = 0;
+          const chunkChars = maxTokens * 4;
+          while (start < p.length) {
+            const part = p.slice(start, start + chunkChars);
+            const payload = `${header}\n\n${part.trim()}`;
+            if (part.trim()) chunks.push({ sectionPath, text: payload });
+            start += chunkChars - overlapChars;
+            if (start < 0) start = 0;
+          }
+          buffer = "";
+          continue;
+        }
+
+        buffer = p;
+      }
+
+      flush();
+    }
+
+    return chunks;
+  }
+
+  function isLikelyTextMime(mimeType, filename) {
+    const mt = String(mimeType || "").toLowerCase();
+    if (mt.startsWith("text/")) return true;
+    if (mt.includes("json") || mt.includes("xml") || mt.includes("yaml") || mt.includes("csv")) return true;
+    const name = String(filename || "").toLowerCase();
+    return Boolean(name.match(/\.(txt|md|markdown|csv|tsv|json|yaml|yml|xml)$/));
+  }
+
+  function shouldForceFileSearch(msg) {
+    const s = String(msg || "").toLowerCase();
+    return /\b(doc|document|file|tab|section|chapter|above|below|in this|in the doc|in the file|from the doc)\b/i.test(s);
+  }
+
+  function isComplexPrompt(msg) {
+    const s = String(msg || "");
+    if (s.length > 400) return true;
+    return /\b(compare|options|trade-?off|design|architecture|root cause|strategy|plan|proposal|alternatives|risk|mitigation)\b/i.test(s);
+  }
+
+  function extractSourcesFromResponse_(response) {
+    const sources = [];
+    const output = response && Array.isArray(response.output) ? response.output : [];
+
+    for (const item of output) {
+      const content = item && Array.isArray(item.content) ? item.content : [];
+      for (const c of content) {
+        const annotations = c && Array.isArray(c.annotations) ? c.annotations : [];
+        for (const ann of annotations) {
+          const fileId = ann.file_id || ann.fileId || ann?.file?.id;
+          if (!fileId) continue;
+          const quote = ann.quote || ann.text || c.text || "";
+          sources.push({ fileId: String(fileId), quote: String(quote || "") });
+        }
+      }
+
+      // Tool-result best-effort (file_search output may include file ids/text)
+      if (item && item.type === "tool_result" && item.name === "file_search") {
+        const results = item.output || item.results || [];
+        if (Array.isArray(results)) {
+          for (const r of results) {
+            const fileId = r.file_id || r.fileId || r?.file?.id;
+            if (!fileId) continue;
+            const quote = r.text || r.snippet || "";
+            sources.push({ fileId: String(fileId), quote: String(quote || "") });
+          }
+        }
+      }
+    }
+
+    // Deduplicate by fileId + quote prefix
+    const dedup = new Map();
+    for (const s of sources) {
+      const key = `${s.fileId}::${String(s.quote || "").slice(0, 80)}`;
+      if (!dedup.has(key)) dedup.set(key, s);
+    }
+
+    return Array.from(dedup.values());
+  }
+
+  async function resolveSourceMetadata_(docId, fileIds) {
+    const ids = Array.isArray(fileIds) ? fileIds.filter(Boolean) : [];
+    if (!ids.length) return new Map();
+
+    const result = await pool.query(
+      `
+        SELECT vector_store_file_id, filename, kind
+        FROM docs_files
+        WHERE doc_id = $1 AND vector_store_file_id = ANY($2::text[])
+      `,
+      [String(docId), ids]
+    );
+
+    const map = new Map();
+    for (const row of result.rows || []) {
+      map.set(String(row.vector_store_file_id), {
+        filename: row.filename,
+        kind: row.kind,
+      });
+    }
+    return map;
+  }
+
+  function extractSectionFromQuote_(quote) {
+    const m = String(quote || "").match(/Section:\s*(.+)/i);
+    return m ? String(m[1]).trim() : "";
+  }
+
+  function clipSnippet(text, maxLen = 240) {
+    const s = String(text || "").replace(/\s+/g, " ").trim();
+    if (s.length <= maxLen) return s;
+    return s.slice(0, maxLen) + "…";
+  }
+
+  function logChatEvent_(payload) {
+    if (!cfg.chatLogEnabled) return;
+    const safe = {
+      ts: new Date().toISOString(),
+      event: "v2.chat",
+      ...payload,
+    };
+    try {
+      if (typeof logger.info === "function") logger.info(JSON.stringify(safe));
+      else logger.log(JSON.stringify(safe));
+    } catch (_) {
+      // ignore logging errors
+    }
+  }
+
+  function extractPassagesFromPlan_(text) {
+    const lines = String(text || "").split("\n");
+    const passages = [];
+    for (const line of lines) {
+      const m = line.match(/^-\s+(.+)/);
+      if (m && m[1]) passages.push(m[1].trim());
+    }
+    return passages.filter(Boolean).slice(0, 6);
+  }
+
+  async function recordVectorStoreChunkFile(
+    docId,
+    kind,
+    filename,
+    sha256,
+    vectorStoreFileId,
+    { fileVectorStoreId = null, fileVectorStoreFileId = null } = {}
+  ) {
+    await pool.query(
+      `
+        INSERT INTO docs_files (
+          doc_id,
+          kind,
+          filename,
+          sha256,
+          vector_store_file_id,
+          file_vector_store_id,
+          file_vector_store_file_id
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (doc_id, kind, sha256)
+        DO UPDATE SET
+          filename = EXCLUDED.filename,
+          vector_store_file_id = COALESCE(docs_files.vector_store_file_id, EXCLUDED.vector_store_file_id),
+          file_vector_store_id = EXCLUDED.file_vector_store_id,
+          file_vector_store_file_id = EXCLUDED.file_vector_store_file_id
+      `,
+      [docId, kind, filename, sha256, vectorStoreFileId, fileVectorStoreId, fileVectorStoreFileId]
+    );
+  }
+
+  async function updateDocSummary_({ docId, title, kind, text, previousSummary }) {
+    if (!cfg.summaryEnabled) return null;
+    if (!client?.responses || typeof client.responses.create !== "function") return null;
+    const raw = String(text || "").trim();
+    if (!raw) return null;
+
+    const clipped = raw.slice(0, cfg.summaryInputMaxChars);
+    const prev = String(previousSummary || "").trim();
+    const instruction = `You summarize project content for future Q&A.\n\nReturn a concise summary (max ${cfg.summaryMaxChars} chars) covering: goals, key facts, decisions, open questions. Use short paragraphs or bullets. Do NOT include sensitive data.`;
+
+    const input = prev
+      ? `Previous summary:\n${prev}\n\nNew content (${kind || "doc"}${title ? `: ${title}` : ""}):\n${clipped}`
+      : `Content (${kind || "doc"}${title ? `: ${title}` : ""}):\n${clipped}`;
+
+    const response = await client.responses.create({
+      model: cfg.openaiModel,
+      instructions: instruction,
+      input,
+      max_output_tokens: Math.min(600, cfg.maxOutputTokens),
+    });
+
+    const summary = String(response.output_text || "").trim().slice(0, cfg.summaryMaxChars);
+    if (!summary) return null;
+
+    await pool.query(
+      `UPDATE docs_sessions SET doc_summary = $2, doc_summary_updated_at = NOW(), updated_at = NOW() WHERE doc_id = $1`,
+      [String(docId), summary]
+    );
+
+    return summary;
   }
 
   async function ensureTables() {
@@ -251,6 +601,8 @@ export function createApp({
         vector_store_id TEXT NOT NULL,
         instructions TEXT,
         model TEXT,
+        doc_summary TEXT,
+        doc_summary_updated_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
@@ -273,6 +625,8 @@ export function createApp({
     // Legacy installs: add new columns if they don't exist.
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_id TEXT;`);
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_file_id TEXT;`);
+    await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary TEXT;`);
+    await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary_updated_at TIMESTAMPTZ;`);
 
     // ----- Indexes & constraints (idempotent) -----
     // 1) Dedupe any legacy duplicates before adding unique index.
@@ -451,7 +805,7 @@ export function createApp({
 
     const fetchAndMaybeUpdate_ = async (db) => {
       const existing = await db.query(
-        `SELECT doc_id, conversation_id, vector_store_id, instructions, model FROM docs_sessions WHERE doc_id = $1`,
+        `SELECT doc_id, conversation_id, vector_store_id, instructions, model, doc_summary, doc_summary_updated_at FROM docs_sessions WHERE doc_id = $1`,
         [docId]
       );
 
@@ -905,6 +1259,7 @@ export function createApp({
             file_vector_store_id
           FROM docs_files
           WHERE doc_id = $1
+            AND kind NOT IN ('doc_chunk', 'tab_chunk', 'upload_chunk')
           ORDER BY created_at DESC, id DESC
         `,
         [String(docId)]
@@ -1084,46 +1439,121 @@ export function createApp({
         });
       }
 
-      const title = String(docTitle || "document").replace(/[^a-zA-Z0-9._-]+/g, "_");
-      const filename = `${title || "document"}_${String(docId).slice(0, 8)}.txt`;
-      const buf = Buffer.from(docText, "utf8");
-      const hash = sha256Hex(buf);
+      const safeTitle = String(docTitle || "document").replace(/[^a-zA-Z0-9._-]+/g, "_");
+      const docEntryFilename = `${safeTitle || "document"}_${String(docId).slice(0, 8)}.txt`;
+      const formatted = normalizeStructuredText(docText);
+      if (!formatted) {
+        throw new Error("This tab is empty.");
+      }
 
-      const existing = await findExistingDocsFileByHash_(String(docId), "doc", hash);
-      if (existing?.vector_store_file_id) {
-        return res.json({
-          vectorStoreFileId: existing.vector_store_file_id,
-          docsFileId: existing.id,
-          reused: true,
-          hasFileScope: Boolean(existing.file_vector_store_id),
-        });
+      const docHash = sha256Hex(Buffer.from(formatted, "utf8"));
+      if (!replaceKnowledge) {
+        const existingDoc = await findExistingDocsFileByHash_(String(docId), "doc", docHash);
+        if (existingDoc?.vector_store_file_id) {
+          return res.json({
+            vectorStoreFileId: existingDoc.vector_store_file_id,
+            docsFileId: existingDoc.id,
+            reused: true,
+            hasFileScope: Boolean(existingDoc.file_vector_store_id),
+          });
+        }
       }
 
       // Create a per-file vector store for file-scoped chat.
       const fileVectorStore = await client.vectorStores.create({
-        name: `docassist-${String(docId)}-doc-${hash.slice(0, 12)}`,
-        metadata: { doc_id: String(docId), kind: "doc", sha256: hash },
+        name: `docassist-${String(docId)}-doc-${docHash.slice(0, 12)}`,
+        metadata: { doc_id: String(docId), kind: "doc", sha256: docHash },
       });
       const fileVectorStoreId = fileVectorStore?.id;
 
-      const uploadableDoc = await toFile(buf, filename, { type: "text/plain" });
-      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableDoc);
+      const chunks = cfg.chunkingEnabled
+        ? buildChunksFromStructuredText(formatted, {
+            maxTokens: cfg.chunkMaxTokens,
+            overlapTokens: cfg.chunkOverlapTokens,
+          })
+        : [{ sectionPath: "", text: formatted }];
 
-      const uploadableFileScope = await toFile(buf, filename, { type: "text/plain" });
-      const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-        fileVectorStoreId,
-        uploadableFileScope
-      );
+      if (!chunks.length) {
+        throw new Error("No content to sync.");
+      }
 
-      await recordVectorStoreFile(String(docId), "doc", filename, hash, vsFile.id, {
+      let firstDocVsfId = null;
+      let firstFileScopeVsfId = null;
+
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunk = chunks[i];
+        const chunkText = String(chunk.text || "").trim();
+        if (!chunkText) continue;
+
+        const chunkHash = sha256Hex(Buffer.from(chunkText, "utf8"));
+        const chunkKind = "doc_chunk";
+        const sectionSlug = slugifyForFilename(chunk.sectionPath || `part-${i + 1}`);
+        let chunkFilename = `${safeTitle || "document"}_${String(docId).slice(0, 8)}__${sectionSlug}__part-${i + 1}.txt`;
+        if (chunkFilename.length > cfg.maxFilenameChars) {
+          chunkFilename = chunkFilename.slice(0, cfg.maxFilenameChars);
+        }
+
+        let docVsfId = null;
+        if (!replaceKnowledge) {
+          const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
+          docVsfId = existingChunk?.vector_store_file_id || null;
+        }
+
+        if (!docVsfId) {
+          const uploadableChunk = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+            type: "text/plain",
+          });
+          const vsFile = await client.vectorStores.files.uploadAndPoll(
+            session.vector_store_id,
+            uploadableChunk
+          );
+          docVsfId = vsFile.id;
+        }
+
+        const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+          type: "text/plain",
+        });
+        const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+          fileVectorStoreId,
+          uploadableFileScope
+        );
+
+        await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
+          fileVectorStoreId,
+          fileVectorStoreFileId: fileScopeVsf?.id || null,
+        });
+
+        if (!firstDocVsfId) {
+          firstDocVsfId = docVsfId;
+          firstFileScopeVsfId = fileScopeVsf?.id || null;
+        }
+      }
+
+      if (!firstDocVsfId) {
+        throw new Error("No content to sync.");
+      }
+
+      await recordVectorStoreFile(String(docId), "doc", docEntryFilename, docHash, firstDocVsfId, {
         fileVectorStoreId,
-        fileVectorStoreFileId: fileScopeVsf?.id || null,
+        fileVectorStoreFileId: firstFileScopeVsfId,
       });
 
+      try {
+        await updateDocSummary_({
+          docId: String(docId),
+          title: String(docTitle || ""),
+          kind: "doc",
+          text: formatted,
+          previousSummary: session.doc_summary,
+        });
+      } catch (e) {
+        logger.error(e);
+      }
+
       // Best-effort: fetch docs_files id for UI convenience.
-      const created = await findExistingDocsFileByHash_(String(docId), "doc", hash);
+      const created = await findExistingDocsFileByHash_(String(docId), "doc", docHash);
       return res.json({
-        vectorStoreFileId: vsFile.id,
+        vectorStoreFileId: firstDocVsfId,
         docsFileId: created?.id,
         fileVectorStoreId,
         reused: false,
@@ -1196,52 +1626,128 @@ export function createApp({
         });
       }
 
-      // Hash includes tabId to avoid cross-tab dedupe collisions.
-      const buf = Buffer.from(tabText, "utf8");
-      const hash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${String(tabText)}`, "utf8"));
-
-      const existing = await findExistingDocsFileByHash_(String(docId), "tab", hash);
-      if (existing?.vector_store_file_id) {
-        return res.json({
-          vectorStoreFileId: existing.vector_store_file_id,
-          docsFileId: existing.id,
-          reused: true,
-          hasFileScope: Boolean(existing.file_vector_store_id),
-        });
-      }
-
       const safeTabTitle = String(tabTitle || "tab").replace(/[^a-zA-Z0-9._-]+/g, "_");
       const safeTabId = String(tabId).replace(/[^a-zA-Z0-9._-]+/g, "_");
       const safeDocPrefix = String(docId).slice(0, 8);
-      let filename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${safeDocPrefix}.txt`;
-      if (filename.length > cfg.maxFilenameChars) {
-        filename = filename.slice(0, cfg.maxFilenameChars);
+      let tabEntryFilename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${safeDocPrefix}.txt`;
+      if (tabEntryFilename.length > cfg.maxFilenameChars) {
+        tabEntryFilename = tabEntryFilename.slice(0, cfg.maxFilenameChars);
+      }
+
+      const formatted = normalizeStructuredText(tabText);
+      if (!formatted) {
+        throw new Error("This tab is empty.");
+      }
+
+      // Hash includes tabId to avoid cross-tab dedupe collisions.
+      const tabHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${formatted}`, "utf8"));
+
+      if (!replaceKnowledge) {
+        const existingTab = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
+        if (existingTab?.vector_store_file_id) {
+          return res.json({
+            vectorStoreFileId: existingTab.vector_store_file_id,
+            docsFileId: existingTab.id,
+            reused: true,
+            hasFileScope: Boolean(existingTab.file_vector_store_id),
+          });
+        }
       }
 
       const fileVectorStore = await client.vectorStores.create({
-        name: `docassist-${String(docId)}-tab-${hash.slice(0, 12)}`,
-        metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: hash },
+        name: `docassist-${String(docId)}-tab-${tabHash.slice(0, 12)}`,
+        metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: tabHash },
       });
       const fileVectorStoreId = fileVectorStore?.id;
 
-      const uploadableTab = await toFile(buf, filename, { type: "text/plain" });
-      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableTab);
+      const chunks = cfg.chunkingEnabled
+        ? buildChunksFromStructuredText(formatted, {
+            maxTokens: cfg.chunkMaxTokens,
+            overlapTokens: cfg.chunkOverlapTokens,
+          })
+        : [{ sectionPath: "", text: formatted }];
 
-      const uploadableFileScope = await toFile(buf, filename, { type: "text/plain" });
-      const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-        fileVectorStoreId,
-        uploadableFileScope
-      );
+      if (!chunks.length) {
+        throw new Error("No content to sync.");
+      }
 
-      await recordVectorStoreFile(String(docId), "tab", filename, hash, vsFile.id, {
+      let firstDocVsfId = null;
+      let firstFileScopeVsfId = null;
+
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunk = chunks[i];
+        const chunkText = String(chunk.text || "").trim();
+        if (!chunkText) continue;
+
+        const chunkHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${chunkText}`, "utf8"));
+        const chunkKind = "tab_chunk";
+        const sectionSlug = slugifyForFilename(chunk.sectionPath || `part-${i + 1}`);
+        let chunkFilename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${sectionSlug}__part-${i + 1}.txt`;
+        if (chunkFilename.length > cfg.maxFilenameChars) {
+          chunkFilename = chunkFilename.slice(0, cfg.maxFilenameChars);
+        }
+
+        let docVsfId = null;
+        if (!replaceKnowledge) {
+          const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
+          docVsfId = existingChunk?.vector_store_file_id || null;
+        }
+
+        if (!docVsfId) {
+          const uploadableChunk = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+            type: "text/plain",
+          });
+          const vsFile = await client.vectorStores.files.uploadAndPoll(
+            session.vector_store_id,
+            uploadableChunk
+          );
+          docVsfId = vsFile.id;
+        }
+
+        const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+          type: "text/plain",
+        });
+        const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+          fileVectorStoreId,
+          uploadableFileScope
+        );
+
+        await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
+          fileVectorStoreId,
+          fileVectorStoreFileId: fileScopeVsf?.id || null,
+        });
+
+        if (!firstDocVsfId) {
+          firstDocVsfId = docVsfId;
+          firstFileScopeVsfId = fileScopeVsf?.id || null;
+        }
+      }
+
+      if (!firstDocVsfId) {
+        throw new Error("No content to sync.");
+      }
+
+      await recordVectorStoreFile(String(docId), "tab", tabEntryFilename, tabHash, firstDocVsfId, {
         fileVectorStoreId,
-        fileVectorStoreFileId: fileScopeVsf?.id || null,
+        fileVectorStoreFileId: firstFileScopeVsfId,
       });
 
+      try {
+        await updateDocSummary_({
+          docId: String(docId),
+          title: String(tabTitle || ""),
+          kind: "tab",
+          text: formatted,
+          previousSummary: session.doc_summary,
+        });
+      } catch (e) {
+        logger.error(e);
+      }
+
       // Best-effort: fetch docs_files id for UI convenience.
-      const created = await findExistingDocsFileByHash_(String(docId), "tab", hash);
+      const created = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
       return res.json({
-        vectorStoreFileId: vsFile.id,
+        vectorStoreFileId: firstDocVsfId,
         docsFileId: created?.id,
         fileVectorStoreId,
         reused: false,
@@ -1376,6 +1882,21 @@ export function createApp({
         fileVectorStoreFileId: fileScopeVsf?.id || null,
       });
 
+      if (isLikelyTextMime(mimeType, safeName)) {
+        try {
+          const text = buf.toString("utf8");
+          await updateDocSummary_({
+            docId: String(docId),
+            title: String(filename || ""),
+            kind: "upload",
+            text,
+            previousSummary: session.doc_summary,
+          });
+        } catch (e) {
+          logger.error(e);
+        }
+      }
+
       const created = await findExistingDocsFileByHash_(String(docId), "upload", hash);
 
       return res.json({
@@ -1394,6 +1915,7 @@ export function createApp({
 
   app.post("/v2/chat", async (req, res) => {
     try {
+      const started = Date.now();
       if (!isPlainObject(req.body)) {
         return res.status(400).json(jsonError(req, "Invalid JSON body"));
       }
@@ -1471,10 +1993,11 @@ export function createApp({
         });
       }
 
-      const response = await client.responses.create({
+      const forceSearch = cfg.forceFileSearch && shouldForceFileSearch(msgStr);
+      const baseRequest = {
         model: session.model || cfg.openaiModel,
         conversation: session.conversation_id,
-        instructions: buildInstructions(session.instructions),
+        instructions: buildInstructions(session.instructions, session.doc_summary),
         tools: [
           {
             type: "file_search",
@@ -1483,9 +2006,59 @@ export function createApp({
         ],
         input: msgStr,
         max_output_tokens: cfg.maxOutputTokens,
-      });
+      };
+      if (forceSearch) {
+        baseRequest.tool_choice = { type: "file_search" };
+      }
+
+      let response;
+      let usedSources = [];
+
+      if (cfg.twoStepEnabled && isComplexPrompt(msgStr)) {
+        const planInput =
+          "You must use file_search. Return a brief plan and 3-6 quoted passages.\n" +
+          "Format:\nPLAN: <2-5 bullets>\nPASSAGES:\n- <quote>\n- <quote>\n" +
+          `\nQuestion: ${msgStr}`;
+
+        const planResponse = await client.responses.create({
+          ...baseRequest,
+          input: planInput,
+        });
+
+        usedSources = extractSourcesFromResponse_(planResponse);
+        const passages = extractPassagesFromPlan_(String(planResponse.output_text || ""));
+        const passageBlock = passages.length ? passages.join("\n") : "(no passages returned)";
+
+        const step2Input =
+          "Answer the question using ONLY the passages below. If information is missing, say so.\n\n" +
+          `PASSAGES:\n${passageBlock}\n\nQUESTION:\n${msgStr}`;
+
+        response = await client.responses.create({
+          model: session.model || cfg.openaiModel,
+          conversation: session.conversation_id,
+          instructions: buildInstructions(session.instructions, session.doc_summary),
+          input: step2Input,
+          max_output_tokens: cfg.maxOutputTokens,
+        });
+      } else {
+        response = await client.responses.create(baseRequest);
+        usedSources = extractSourcesFromResponse_(response);
+      }
 
       const replyText = String(response.output_text || "").trim();
+      const sourceFileIds = usedSources.map((s) => s.fileId).filter(Boolean);
+      const fileMeta = await resolveSourceMetadata_(String(docId), sourceFileIds);
+      const sources = usedSources.map((s) => {
+        const meta = fileMeta.get(String(s.fileId)) || {};
+        const section = extractSectionFromQuote_(s.quote);
+        return {
+          fileId: s.fileId,
+          filename: meta.filename,
+          kind: meta.kind,
+          section,
+          snippet: clipSnippet(s.quote),
+        };
+      });
 
       try {
         await appendToHistory(String(docId), "user", msgStr);
@@ -1494,9 +2067,23 @@ export function createApp({
         logger.error(e);
       }
 
+      const usage = response?.usage || {};
+      logChatEvent_({
+        docId: String(docId),
+        scope: scopedVectorStoreId ? "file" : "all",
+        fileId: scopedFileId || null,
+        model: session.model || cfg.openaiModel,
+        forceSearch: Boolean(forceSearch),
+        twoStep: Boolean(cfg.twoStepEnabled && isComplexPrompt(msgStr)),
+        usedSources: sources.length,
+        usage,
+        latencyMs: Date.now() - started,
+      });
+
       return res.json({
         reply: replyText,
         responseId: response.id,
+        sources,
         scope: scopedVectorStoreId
           ? { type: "file", fileId: scopedFileId }
           : { type: "all" },

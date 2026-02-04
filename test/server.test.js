@@ -742,9 +742,9 @@ test("POST /v2/sync-tab uploads and records a tab entry", async () => {
   assert.ok(openaiCalls.find((c) => c.op === "vs.create"));
   assert.equal(openaiCalls.filter((c) => c.op === "vs.files.uploadAndPoll").length, 2);
 
-  // Ensure we inserted with kind='tab'
+  // Ensure we inserted a tab entry (and chunk entries may exist)
   assert.ok(inserts.length >= 1);
-  assert.equal(inserts[0].params[1], "tab");
+  assert.ok(inserts.find((i) => i.params[1] === "tab"));
 });
 
 test("POST /v2/upload-file replaceKnowledge=true deletes old files before upload", async () => {
