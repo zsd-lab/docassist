@@ -526,7 +526,12 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     filename,
     sha256,
     vectorStoreFileId,
-    { fileVectorStoreId = null, fileVectorStoreFileId = null } = {}
+    {
+      fileVectorStoreId = null,
+      fileVectorStoreFileId = null,
+      vectorStoreFileFileId = null,
+      fileVectorStoreFileFileId = null,
+    } = {}
   ) {
     await pool.query(
       `
@@ -537,17 +542,31 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
           sha256,
           vector_store_file_id,
           file_vector_store_id,
-          file_vector_store_file_id
+          file_vector_store_file_id,
+          vector_store_file_file_id,
+          file_vector_store_file_file_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (doc_id, kind, sha256)
         DO UPDATE SET
           filename = EXCLUDED.filename,
           vector_store_file_id = COALESCE(docs_files.vector_store_file_id, EXCLUDED.vector_store_file_id),
           file_vector_store_id = EXCLUDED.file_vector_store_id,
-          file_vector_store_file_id = EXCLUDED.file_vector_store_file_id
+          file_vector_store_file_id = EXCLUDED.file_vector_store_file_id,
+          vector_store_file_file_id = COALESCE(docs_files.vector_store_file_file_id, EXCLUDED.vector_store_file_file_id),
+          file_vector_store_file_file_id = EXCLUDED.file_vector_store_file_file_id
       `,
-      [docId, kind, filename, sha256, vectorStoreFileId, fileVectorStoreId, fileVectorStoreFileId]
+      [
+        docId,
+        kind,
+        filename,
+        sha256,
+        vectorStoreFileId,
+        fileVectorStoreId,
+        fileVectorStoreFileId,
+        vectorStoreFileFileId,
+        fileVectorStoreFileFileId,
+      ]
     );
   }
 
@@ -618,6 +637,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         vector_store_file_id TEXT NOT NULL,
         file_vector_store_id TEXT,
         file_vector_store_file_id TEXT,
+        vector_store_file_file_id TEXT,
+        file_vector_store_file_file_id TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
@@ -625,6 +646,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     // Legacy installs: add new columns if they don't exist.
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_id TEXT;`);
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_file_id TEXT;`);
+    await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS vector_store_file_file_id TEXT;`);
+    await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_file_file_id TEXT;`);
     await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary TEXT;`);
     await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary_updated_at TIMESTAMPTZ;`);
 
@@ -664,7 +687,12 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     filename,
     sha256,
     vectorStoreFileId,
-    { fileVectorStoreId = null, fileVectorStoreFileId = null } = {}
+    {
+      fileVectorStoreId = null,
+      fileVectorStoreFileId = null,
+      vectorStoreFileFileId = null,
+      fileVectorStoreFileFileId = null,
+    } = {}
   ) {
     await pool.query(
       `
@@ -675,12 +703,24 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
           sha256,
           vector_store_file_id,
           file_vector_store_id,
-          file_vector_store_file_id
+          file_vector_store_file_id,
+          vector_store_file_file_id,
+          file_vector_store_file_file_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (doc_id, kind, sha256) DO NOTHING
       `,
-      [docId, kind, filename, sha256, vectorStoreFileId, fileVectorStoreId, fileVectorStoreFileId]
+      [
+        docId,
+        kind,
+        filename,
+        sha256,
+        vectorStoreFileId,
+        fileVectorStoreId,
+        fileVectorStoreFileId,
+        vectorStoreFileFileId,
+        fileVectorStoreFileFileId,
+      ]
     );
   }
 
@@ -705,7 +745,9 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
           id,
           vector_store_file_id,
           file_vector_store_id,
-          file_vector_store_file_id
+          file_vector_store_file_id,
+          vector_store_file_file_id,
+          file_vector_store_file_file_id
         FROM docs_files
         WHERE doc_id = $1 AND kind = $2 AND sha256 = $3
         ORDER BY created_at DESC, id DESC
@@ -779,6 +821,66 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     return { attempted: ids.length, deleted, failed, deletedIds };
   }
 
+  async function bestEffortDeleteOpenAIFilesByIds_({ fileIds }) {
+    const ids = Array.isArray(fileIds) ? fileIds.filter(Boolean) : [];
+    if (!ids.length) return { attempted: 0, deleted: 0, failed: 0, deletedIds: [] };
+
+    let deleted = 0;
+    let failed = 0;
+    const deletedIds = [];
+
+    for (const fileId of ids) {
+      try {
+        if (!client?.files) {
+          failed++;
+          continue;
+        }
+
+        if (typeof client.files.del === "function") {
+          await client.files.del(fileId);
+        } else if (typeof client.files.delete === "function") {
+          await client.files.delete(fileId);
+        } else {
+          failed++;
+          continue;
+        }
+
+        deleted++;
+        deletedIds.push(fileId);
+      } catch (_) {
+        failed++;
+      }
+    }
+
+    return { attempted: ids.length, deleted, failed, deletedIds };
+  }
+
+  async function bestEffortCollectFileIdsFromVectorStoreFiles_({ vectorStoreId, vectorStoreFileIds }) {
+    const ids = Array.isArray(vectorStoreFileIds) ? vectorStoreFileIds.filter(Boolean) : [];
+    if (!vectorStoreId || !ids.length) return [];
+
+    const filesApi = client?.vectorStores?.files;
+    if (!filesApi) return [];
+
+    const out = new Set();
+    for (const vsFileId of ids) {
+      try {
+        let info = null;
+        if (typeof filesApi.retrieve === "function") {
+          info = await filesApi.retrieve(vectorStoreId, vsFileId);
+        } else if (typeof filesApi.get === "function") {
+          info = await filesApi.get(vectorStoreId, vsFileId);
+        }
+        const fid = info?.file_id || info?.fileId || null;
+        if (fid) out.add(String(fid));
+      } catch (_) {
+        // best-effort
+      }
+    }
+
+    return Array.from(out);
+  }
+
   async function bestEffortCleanupOpenAIForDoc_({ docId }) {
     const result = {
       docId: String(docId),
@@ -788,11 +890,13 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         fileVectorStores: 0,
         docVectorStore: 0,
         conversation: 0,
+        files: 0,
       },
       attempted: {
         docVectorStoreFiles: 0,
         fileVectorStoreFiles: 0,
         fileVectorStores: 0,
+        files: 0,
       },
     };
 
@@ -803,12 +907,17 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
     const row = s.rows?.[0];
 
     const f = await pool.query(
-      `SELECT vector_store_file_id, file_vector_store_id, file_vector_store_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
+      `SELECT vector_store_file_id, file_vector_store_id, file_vector_store_file_id, vector_store_file_file_id, file_vector_store_file_file_id FROM docs_files WHERE doc_id = $1 ORDER BY created_at DESC, id DESC`,
       [String(docId)]
     );
     const docVsFileIds = (f.rows || []).map((r) => r.vector_store_file_id).filter(Boolean);
     const fileVsIds = Array.from(
       new Set((f.rows || []).map((r) => r.file_vector_store_id).filter(Boolean))
+    );
+    const openaiFileIds = new Set(
+      (f.rows || [])
+        .flatMap((r) => [r.vector_store_file_file_id, r.file_vector_store_file_file_id])
+        .filter(Boolean)
     );
     const fileVsFileIdsByStore = new Map();
     for (const row of f.rows || []) {
@@ -907,6 +1016,30 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       } catch (_) {
         // best-effort
       }
+    }
+
+    // Delete underlying OpenAI files if available.
+    if (vectorStoreId && docVsFileIds.length) {
+      const resolved = await bestEffortCollectFileIdsFromVectorStoreFiles_({
+        vectorStoreId,
+        vectorStoreFileIds: docVsFileIds,
+      });
+      resolved.forEach((id) => openaiFileIds.add(id));
+    }
+    for (const vsId of fileVsIds) {
+      const vsFileIds = fileVsFileIdsByStore.get(vsId) || [];
+      if (!vsFileIds.length) continue;
+      const resolved = await bestEffortCollectFileIdsFromVectorStoreFiles_({
+        vectorStoreId: vsId,
+        vectorStoreFileIds: vsFileIds,
+      });
+      resolved.forEach((id) => openaiFileIds.add(id));
+    }
+
+    if (openaiFileIds.size) {
+      const delFiles = await bestEffortDeleteOpenAIFilesByIds_({ fileIds: Array.from(openaiFileIds) });
+      result.attempted.files = delFiles.attempted;
+      result.deleted.files = delFiles.deleted;
     }
 
     return result;
@@ -1545,6 +1678,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
 
       let firstDocVsfId = null;
       let firstFileScopeVsfId = null;
+      let firstDocVsfFileId = null;
+      let firstFileScopeVsfFileId = null;
 
       for (let i = 0; i < chunks.length; i += 1) {
         const chunk = chunks[i];
@@ -1560,9 +1695,11 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         }
 
         let docVsfId = null;
+        let docVsfFileId = null;
         if (!replaceKnowledge) {
           const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
           docVsfId = existingChunk?.vector_store_file_id || null;
+          docVsfFileId = existingChunk?.vector_store_file_file_id || null;
         }
 
         if (!docVsfId) {
@@ -1574,9 +1711,11 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
             uploadableChunk
           );
           docVsfId = vsFile.id;
+          docVsfFileId = vsFile?.file_id || vsFile?.fileId || null;
         }
 
         let fileScopeVsf = null;
+        let fileScopeVsfFileId = null;
         if (fileScopeEnabled && fileVectorStoreId) {
           const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
             type: "text/plain",
@@ -1585,16 +1724,21 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
             fileVectorStoreId,
             uploadableFileScope
           );
+          fileScopeVsfFileId = fileScopeVsf?.file_id || fileScopeVsf?.fileId || null;
         }
 
         await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
           fileVectorStoreId: fileVectorStoreId,
           fileVectorStoreFileId: fileScopeVsf?.id || null,
+          vectorStoreFileFileId: docVsfFileId,
+          fileVectorStoreFileFileId: fileScopeVsfFileId,
         });
 
         if (!firstDocVsfId) {
           firstDocVsfId = docVsfId;
           firstFileScopeVsfId = fileScopeVsf?.id || null;
+          firstDocVsfFileId = docVsfFileId;
+          firstFileScopeVsfFileId = fileScopeVsfFileId;
         }
       }
 
@@ -1605,6 +1749,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       await recordVectorStoreFile(String(docId), "doc", docEntryFilename, docHash, firstDocVsfId, {
         fileVectorStoreId: fileVectorStoreId,
         fileVectorStoreFileId: firstFileScopeVsfId,
+        vectorStoreFileFileId: firstDocVsfFileId,
+        fileVectorStoreFileFileId: firstFileScopeVsfFileId,
       });
 
       try {
@@ -1753,6 +1899,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
 
       let firstDocVsfId = null;
       let firstFileScopeVsfId = null;
+      let firstDocVsfFileId = null;
+      let firstFileScopeVsfFileId = null;
 
       for (let i = 0; i < chunks.length; i += 1) {
         const chunk = chunks[i];
@@ -1768,9 +1916,11 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
         }
 
         let docVsfId = null;
+        let docVsfFileId = null;
         if (!replaceKnowledge) {
           const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
           docVsfId = existingChunk?.vector_store_file_id || null;
+          docVsfFileId = existingChunk?.vector_store_file_file_id || null;
         }
 
         if (!docVsfId) {
@@ -1782,9 +1932,11 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
             uploadableChunk
           );
           docVsfId = vsFile.id;
+          docVsfFileId = vsFile?.file_id || vsFile?.fileId || null;
         }
 
         let fileScopeVsf = null;
+        let fileScopeVsfFileId = null;
         if (fileScopeEnabled && fileVectorStoreId) {
           const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
             type: "text/plain",
@@ -1793,16 +1945,21 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
             fileVectorStoreId,
             uploadableFileScope
           );
+          fileScopeVsfFileId = fileScopeVsf?.file_id || fileScopeVsf?.fileId || null;
         }
 
         await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
           fileVectorStoreId: fileVectorStoreId,
           fileVectorStoreFileId: fileScopeVsf?.id || null,
+          vectorStoreFileFileId: docVsfFileId,
+          fileVectorStoreFileFileId: fileScopeVsfFileId,
         });
 
         if (!firstDocVsfId) {
           firstDocVsfId = docVsfId;
           firstFileScopeVsfId = fileScopeVsf?.id || null;
+          firstDocVsfFileId = docVsfFileId;
+          firstFileScopeVsfFileId = fileScopeVsfFileId;
         }
       }
 
@@ -1813,6 +1970,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       await recordVectorStoreFile(String(docId), "tab", tabEntryFilename, tabHash, firstDocVsfId, {
         fileVectorStoreId: fileVectorStoreId,
         fileVectorStoreFileId: firstFileScopeVsfId,
+        vectorStoreFileFileId: firstDocVsfFileId,
+        fileVectorStoreFileFileId: firstFileScopeVsfFileId,
       });
 
       try {
@@ -1963,6 +2122,8 @@ You are a helpful, concise assistant. Ask clarifying questions when needed, be f
       await recordVectorStoreFile(String(docId), "upload", safeName, hash, vsFile.id, {
         fileVectorStoreId,
         fileVectorStoreFileId: fileScopeVsf?.id || null,
+        vectorStoreFileFileId: vsFile?.file_id || vsFile?.fileId || null,
+        fileVectorStoreFileFileId: fileScopeVsf?.file_id || fileScopeVsf?.fileId || null,
       });
 
       if (isLikelyTextMime(mimeType, safeName)) {
