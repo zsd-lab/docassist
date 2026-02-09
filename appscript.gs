@@ -199,6 +199,15 @@ function getChatSidebarHtml_() {
       summary::-webkit-details-marker { display: none; }
       .details-body { margin-top: 10px; }
 
+      /* Chat list (threads) */
+      .chatlist { border: 1px solid #dadce0; border-radius: 6px; background: #fff; max-height: 140px; overflow: auto; }
+      .chatitem { padding: 6px 8px; border-bottom: 1px solid #eee; cursor: pointer; user-select: none; }
+      .chatitem:last-child { border-bottom: none; }
+      .chatitem.active { background: #e8f0fe; }
+      .chatitem .title { font-weight: 600; }
+      .chatitem .meta { font-size: 11px; color: #5f6368; margin-top: 2px; }
+      .inline { display: inline-block; }
+
       /* Rendered markdown inside chat */
       .chat p { margin: 6px 0; }
       .chat h1, .chat h2, .chat h3, .chat h4, .chat h5, .chat h6 { margin: 10px 0 6px; font-size: 13px; }
@@ -211,6 +220,17 @@ function getChatSidebarHtml_() {
   </head>
   <body>
     <div class="top-area">
+      <div class="row">
+        <label>Chats</label>
+        <div class="controls" style="margin-bottom:6px;">
+          <button id="newChatBtn" class="primary">New chat</button>
+          <button id="renameChatBtn">Rename</button>
+          <button id="archiveChatBtn">Archive</button>
+        </div>
+        <div id="chatList" class="chatlist"></div>
+        <div class="small" style="margin-top:6px;">Active: <span id="activeChatTitle">(none)</span></div>
+      </div>
+
       <div class="row chat-row">
         <label>Chat</label>
         <div id="chat" class="chat"></div>
@@ -330,6 +350,10 @@ function getChatSidebarHtml_() {
       const TICK = String.fromCharCode(96);
       const chatHistory = [];
 
+      let chatThreads = [];
+      let activeChatId = null;
+      let activeChatTitle = '';
+
       function escapeHtml(s) {
         return String(s || '')
           .replace(/&/g, '&amp;')
@@ -447,6 +471,131 @@ function getChatSidebarHtml_() {
         el('status').textContent = text || '';
       }
 
+      function setActiveChatUi_(chatId, title) {
+        activeChatId = chatId || null;
+        activeChatTitle = String(title || '').trim();
+        if (el('activeChatTitle')) el('activeChatTitle').textContent = activeChatTitle || (activeChatId ? activeChatId : '(none)');
+      }
+
+      function clearChatUi_() {
+        try { chatHistory.length = 0; } catch (e) {}
+        try { if (el('chat')) el('chat').innerHTML = ''; } catch (e) {}
+      }
+
+      function fmtTime_(iso) {
+        const s = String(iso || '').trim();
+        if (!s) return '';
+        try {
+          const d = new Date(s);
+          if (Number.isNaN(d.getTime())) return '';
+          return d.toLocaleString();
+        } catch (e) {
+          return '';
+        }
+      }
+
+      function renderChatList_() {
+        const listEl = el('chatList');
+        if (!listEl) return;
+        listEl.innerHTML = '';
+
+        const threads = Array.isArray(chatThreads) ? chatThreads : [];
+        if (!threads.length) {
+          const div = document.createElement('div');
+          div.className = 'chatitem';
+          div.textContent = 'No chats yet. Click “New chat”.';
+          listEl.appendChild(div);
+          return;
+        }
+
+        threads.forEach((c) => {
+          const id = c && c.id ? String(c.id) : '';
+          if (!id) return;
+          const title = String(c.title || 'New chat');
+          const updatedAt = c && c.updatedAt ? fmtTime_(c.updatedAt) : '';
+          const item = document.createElement('div');
+          item.className = 'chatitem' + (activeChatId === id ? ' active' : '');
+
+          const t = document.createElement('div');
+          t.className = 'title';
+          t.textContent = title;
+
+          const meta = document.createElement('div');
+          meta.className = 'meta';
+          meta.textContent = updatedAt ? ('Updated: ' + updatedAt) : '';
+
+          item.appendChild(t);
+          item.appendChild(meta);
+          item.addEventListener('click', () => {
+            selectChat_(id, title);
+          });
+
+          listEl.appendChild(item);
+        });
+      }
+
+      function loadChats_({ preferChatId } = {}) {
+        google.script.run
+          .withSuccessHandler((resp) => {
+            const chats = resp && resp.chats ? resp.chats : [];
+            chatThreads = Array.isArray(chats) ? chats : [];
+
+            const preferred = String(preferChatId || '').trim();
+            const pick = preferred && chatThreads.some(c => String(c.id) === preferred)
+              ? preferred
+              : (activeChatId && chatThreads.some(c => String(c.id) === activeChatId) ? activeChatId : (chatThreads[0] ? String(chatThreads[0].id) : ''));
+
+            if (!pick) {
+              setActiveChatUi_(null, '');
+              renderChatList_();
+              clearChatUi_();
+              return;
+            }
+
+            const picked = chatThreads.find(c => String(c.id) === pick) || null;
+            setActiveChatUi_(pick, picked ? picked.title : '');
+            renderChatList_();
+            selectChat_(pick, picked ? picked.title : '');
+          })
+          .withFailureHandler((err) => {
+            setStatus('Failed to load chats: ' + (err && err.message ? err.message : err));
+          })
+          .listChatsForCurrentUser();
+      }
+
+      function selectChat_(chatId, title) {
+        const id = String(chatId || '').trim();
+        if (!id) return;
+        setActiveChatUi_(id, title);
+        renderChatList_();
+        clearChatUi_();
+
+        google.script.run
+          .withSuccessHandler((resp) => {
+            const msgs = resp && resp.messages ? resp.messages : [];
+            const chat = resp && resp.chat ? resp.chat : null;
+            if (chat && chat.title) setActiveChatUi_(id, chat.title);
+            renderChatList_();
+
+            for (const m of (Array.isArray(msgs) ? msgs : [])) {
+              const role = String(m.role || '');
+              const text = String(m.content || '');
+              if (role === 'assistant') addMsg('Assistant', text);
+              else addMsg('You', text);
+            }
+
+            google.script.run
+              .withFailureHandler(() => { /* best-effort */ })
+              .setActiveChatIdForCurrentUser(id);
+
+            setStatus('Ready.');
+          })
+          .withFailureHandler((err) => {
+            setStatus('Failed to load messages: ' + (err && err.message ? err.message : err));
+          })
+          .getChatMessagesForCurrentUser(id);
+      }
+
       async function writeClipboardText_(text) {
         const t = String(text || '');
         if (!t) throw new Error('Nothing to copy.');
@@ -556,10 +705,80 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','resetServerBtn','cleanupOpenaiBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope'].forEach(id => {
+        ['saveSettingsBtn','resetServerBtn','cleanupOpenaiBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope','newChatBtn','renameChatBtn','archiveChatBtn'].forEach(id => {
           try { el(id).disabled = disabled; } catch (e) {}
         });
       }
+
+      el('newChatBtn').addEventListener('click', () => {
+        disableAll(true);
+        setStatus('Creating chat...');
+        google.script.run
+          .withSuccessHandler((resp) => {
+            const chat = resp && resp.chat ? resp.chat : null;
+            const id = chat && chat.id ? String(chat.id) : '';
+            const title = chat && chat.title ? String(chat.title) : 'New chat';
+            if (id) {
+              setActiveChatUi_(id, title);
+              google.script.run.withFailureHandler(() => { /* best-effort */ }).setActiveChatIdForCurrentUser(id);
+            }
+            loadChats_({ preferChatId: id });
+            disableAll(false);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Create chat failed: ' + (err && err.message ? err.message : err));
+            disableAll(false);
+          })
+          .createChatForCurrentUser('');
+      });
+
+      el('renameChatBtn').addEventListener('click', () => {
+        if (!activeChatId) {
+          setStatus('Pick a chat first.');
+          return;
+        }
+        const next = window.prompt('Rename chat:', activeChatTitle || '');
+        if (next == null) return;
+        const title = String(next || '').trim();
+        if (!title) return;
+        disableAll(true);
+        setStatus('Renaming...');
+        google.script.run
+          .withSuccessHandler(() => {
+            setStatus('Renamed.');
+            loadChats_({ preferChatId: activeChatId });
+            disableAll(false);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Rename failed: ' + (err && err.message ? err.message : err));
+            disableAll(false);
+          })
+          .renameChatForCurrentUser(activeChatId, title);
+      });
+
+      el('archiveChatBtn').addEventListener('click', () => {
+        if (!activeChatId) {
+          setStatus('Pick a chat first.');
+          return;
+        }
+        const ok = window.confirm('Archive this chat?');
+        if (!ok) return;
+        disableAll(true);
+        setStatus('Archiving...');
+        google.script.run
+          .withSuccessHandler(() => {
+            setStatus('Archived.');
+            setActiveChatUi_(null, '');
+            clearChatUi_();
+            loadChats_({});
+            disableAll(false);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Archive failed: ' + (err && err.message ? err.message : err));
+            disableAll(false);
+          })
+          .archiveChatForCurrentUser(activeChatId);
+      });
 
       el('copyLastBtn').addEventListener('click', () => copyLastReply_());
 
@@ -599,6 +818,7 @@ function getChatSidebarHtml_() {
           el('baseUrl').value = state.baseUrl || '';
           el('token').value = state.token || '';
           el('instructions').value = state.instructions || '';
+          try { setActiveChatUi_(state.activeChatId || '', ''); } catch (e) {}
           try { if (el('autoAppend')) el('autoAppend').checked = true; } catch (e) {}
           try { if (el('fileScope')) el('fileScope').value = (state.fileScopeId != null ? String(state.fileScopeId) : ''); } catch (e) {}
           try { if (el('tabPicker')) el('tabPicker').value = (state.selectedTabId != null ? String(state.selectedTabId) : ''); } catch (e) {}
@@ -609,6 +829,7 @@ function getChatSidebarHtml_() {
             refreshBackendInfo_();
             refreshFiles_();
             refreshTabs_();
+            loadChats_({ preferChatId: state.activeChatId || '' });
           }
         }).withFailureHandler((err) => {
           setStatus('Error loading state: ' + (err && err.message ? err.message : err));
@@ -878,31 +1099,59 @@ function getChatSidebarHtml_() {
         disableAll(true);
 
         const doSend = () => {
-          setStatus('Thinking...');
-          google.script.run.withSuccessHandler((resp) => {
-            const replyText = (resp && typeof resp.reply !== 'undefined') ? resp.reply : resp;
-            addMsg('Assistant', replyText || '(empty)');
+          const actuallySend_ = () => {
+            setStatus('Thinking...');
+            google.script.run.withSuccessHandler((resp) => {
+              const replyText = (resp && typeof resp.reply !== 'undefined') ? resp.reply : resp;
+              addMsg('Assistant', replyText || '(empty)');
 
-            if (resp && resp.sources && Array.isArray(resp.sources) && resp.sources.length) {
-              addSources_(resp.sources);
-            }
-
-            if (el('autoAppend') && el('autoAppend').checked) {
-              try {
-                google.script.run
-                  .withFailureHandler(() => { /* best-effort */ })
-                  .appendChatTurnToDoc(text, replyText || '');
-              } catch (e) {
-                // best-effort
+              if (resp && resp.sources && Array.isArray(resp.sources) && resp.sources.length) {
+                addSources_(resp.sources);
               }
-            }
 
-            setStatus('Ready.');
-            disableAll(false);
-          }).withFailureHandler((err) => {
-            setStatus('Error: ' + (err && err.message ? err.message : err));
-            disableAll(false);
-          }).sendChatMessage(text, el('instructions').value, el('fileScope') ? el('fileScope').value : '');
+              if (el('autoAppend') && el('autoAppend').checked) {
+                try {
+                  google.script.run
+                    .withFailureHandler(() => { /* best-effort */ })
+                    .appendChatTurnToDoc(text, replyText || '');
+                } catch (e) {
+                  // best-effort
+                }
+              }
+
+              // Refresh list so updated_at ordering matches.
+              try { loadChats_({ preferChatId: activeChatId }); } catch (e) {}
+
+              setStatus('Ready.');
+              disableAll(false);
+            }).withFailureHandler((err) => {
+              setStatus('Error: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+            }).sendChatMessageInChat(text, el('instructions').value, el('fileScope') ? el('fileScope').value : '', activeChatId || '');
+          };
+
+          if (activeChatId) {
+            actuallySend_();
+            return;
+          }
+
+          // Auto-create a chat if none exists.
+          google.script.run
+            .withSuccessHandler((resp) => {
+              const chat = resp && resp.chat ? resp.chat : null;
+              const id = chat && chat.id ? String(chat.id) : '';
+              const title = chat && chat.title ? String(chat.title) : 'New chat';
+              if (id) {
+                setActiveChatUi_(id, title);
+                google.script.run.withFailureHandler(() => { /* best-effort */ }).setActiveChatIdForCurrentUser(id);
+              }
+              actuallySend_();
+            })
+            .withFailureHandler((err) => {
+              setStatus('Failed to create chat: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+            })
+            .createChatForCurrentUser('');
         };
 
         if (el('autoSync').checked) {
@@ -939,6 +1188,8 @@ function getSidebarState() {
   const instructions = docProps.getProperty('DOCASSIST_INSTRUCTIONS') || '';
   const fileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
   const selectedTabId = docProps.getProperty('DOCASSIST_SELECTED_TAB_ID') || '';
+  const userProps = PropertiesService.getUserProperties();
+  const activeChatId = userProps.getProperty('DOCASSIST_ACTIVE_CHAT_ID') || '';
 
   log_('sidebar.get_state', {
     hasBaseUrl: Boolean(baseUrl),
@@ -946,10 +1197,115 @@ function getSidebarState() {
     instructionsLen: String(instructions || '').length,
     hasFileScope: Boolean(String(fileScopeId || '').trim()),
     hasSelectedTab: Boolean(String(selectedTabId || '').trim()),
+    hasActiveChat: Boolean(String(activeChatId || '').trim()),
     ms: Date.now() - started
   });
 
-  return { baseUrl: baseUrl, token: token, instructions: instructions, fileScopeId: fileScopeId, selectedTabId: selectedTabId };
+  return { baseUrl: baseUrl, token: token, instructions: instructions, fileScopeId: fileScopeId, selectedTabId: selectedTabId, activeChatId: activeChatId };
+}
+
+// ====== MULTI-CHAT (global per user) ======
+
+function getOrCreateUserId_() {
+  const userProps = PropertiesService.getUserProperties();
+  const cached = userProps.getProperty('DOCASSIST_USER_ID') || '';
+  if (String(cached).trim()) return String(cached).trim();
+
+  let email = '';
+  try {
+    email = Session.getActiveUser().getEmail() || '';
+  } catch (e) {
+    email = '';
+  }
+
+  const id = String(email || Utilities.getUuid()).trim();
+  userProps.setProperty('DOCASSIST_USER_ID', id);
+  return id;
+}
+
+function setActiveChatIdForCurrentUser(chatId) {
+  const userProps = PropertiesService.getUserProperties();
+  const v = String(chatId || '').trim();
+  if (!v) userProps.deleteProperty('DOCASSIST_ACTIVE_CHAT_ID');
+  else userProps.setProperty('DOCASSIST_ACTIVE_CHAT_ID', v);
+}
+
+function listChatsForCurrentUser() {
+  const userId = getOrCreateUserId_();
+  return callBackendV2Get_('/v2/chats?userId=' + encodeURIComponent(String(userId)));
+}
+
+function createChatForCurrentUser(title) {
+  const userId = getOrCreateUserId_();
+  const resp = callBackendV2_('/v2/chats', {
+    userId: String(userId),
+    title: String(title || '')
+  });
+  try {
+    if (resp && resp.chat && resp.chat.id) setActiveChatIdForCurrentUser(String(resp.chat.id));
+  } catch (e) {}
+  return resp;
+}
+
+function renameChatForCurrentUser(chatId, title) {
+  const userId = getOrCreateUserId_();
+  return callBackendV2WithMethod_('patch', '/v2/chats/' + encodeURIComponent(String(chatId)), {
+    userId: String(userId),
+    title: String(title || '')
+  });
+}
+
+function archiveChatForCurrentUser(chatId) {
+  const userId = getOrCreateUserId_();
+  const resp = callBackendV2_('/v2/chats/' + encodeURIComponent(String(chatId)) + '/archive', {
+    userId: String(userId)
+  });
+  try {
+    const active = PropertiesService.getUserProperties().getProperty('DOCASSIST_ACTIVE_CHAT_ID') || '';
+    if (String(active) === String(chatId)) setActiveChatIdForCurrentUser('');
+  } catch (e) {}
+  return resp;
+}
+
+function getChatMessagesForCurrentUser(chatId) {
+  const userId = getOrCreateUserId_();
+  return callBackendV2Get_('/v2/chats/' + encodeURIComponent(String(chatId)) + '/messages?userId=' + encodeURIComponent(String(userId)));
+}
+
+function sendChatMessageInChat(userMessage, instructionsOverride, fileScopeIdOverride, chatIdOverride) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+  const userId = getOrCreateUserId_();
+  const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
+
+  const userProps = PropertiesService.getUserProperties();
+  const activeChat = String(chatIdOverride || '').trim() || (userProps.getProperty('DOCASSIST_ACTIVE_CHAT_ID') || '');
+  if (!String(activeChat).trim()) throw new Error('No active chat. Create a new chat first.');
+
+  const docProps = PropertiesService.getDocumentProperties();
+  const storedFileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
+  const fileScopeId = String(
+    (typeof fileScopeIdOverride === 'string' ? fileScopeIdOverride : '') || storedFileScopeId || ''
+  ).trim();
+
+  const resp = callBackendV2_('/v2/chats/' + encodeURIComponent(String(activeChat)) + '/send', {
+    userId: String(userId),
+    userMessage: String(userMessage || ''),
+    instructions: String(instructions || ''),
+    docId: doc.getId(),
+    fileId: fileScopeId
+  });
+
+  log_('v2.chat_thread.send', {
+    chatId: String(activeChat),
+    docId: doc.getId(),
+    userMessageLen: String(userMessage || '').length,
+    instructionsLen: String(instructions || '').length,
+    replyLen: resp && resp.reply ? String(resp.reply).length : 0,
+    ms: Date.now() - started
+  });
+
+  return resp;
 }
 
 function setFileScopeIdForThisDocument(fileScopeId) {
@@ -1079,6 +1435,67 @@ function callBackendV2_(path, payload) {
   }
 
   log_('v2.call.ok', {
+    path: path,
+    url: url,
+    responseCode: responseCode,
+    ms: Date.now() - started
+  });
+
+  return json;
+}
+
+function callBackendV2WithMethod_(method, path, payload) {
+  const started = Date.now();
+  const url = getBackendBaseUrl_() + path;
+  const token = getBackendToken_();
+
+  const headers = {};
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  const options = {
+    method: String(method || 'post').toLowerCase(),
+    contentType: 'application/json',
+    headers: headers,
+    payload: JSON.stringify(payload || {}),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseCode = response.getResponseCode();
+  const responseText = response.getContentText();
+
+  let json;
+  try {
+    json = JSON.parse(responseText);
+  } catch (err) {
+    log_('v2.call_method.invalid_json', {
+      method: options.method,
+      path: path,
+      url: url,
+      responseCode: responseCode,
+      responseTextSample: String(responseText || '').slice(0, 300),
+      ms: Date.now() - started
+    });
+    throw new Error('Backend returned invalid JSON: ' + responseText);
+  }
+
+  if (responseCode < 200 || responseCode >= 300) {
+    const errorMsg = json && json.error ? json.error : responseText;
+
+    log_('v2.call_method.error', {
+      method: options.method,
+      path: path,
+      url: url,
+      responseCode: responseCode,
+      error: errorMsg,
+      ms: Date.now() - started
+    });
+
+    throw new Error(errorMsg + ' (HTTP ' + responseCode + ')');
+  }
+
+  log_('v2.call_method.ok', {
+    method: options.method,
     path: path,
     url: url,
     responseCode: responseCode,

@@ -30,6 +30,8 @@ export function createApp({
     maxDocIdChars: config?.maxDocIdChars ?? 256,
     maxUserMessageChars: config?.maxUserMessageChars ?? 20000,
     maxInstructionsChars: config?.maxInstructionsChars ?? 20000,
+    maxUserIdChars: config?.maxUserIdChars ?? 256,
+    maxChatTitleChars: config?.maxChatTitleChars ?? 120,
     maxDocTitleChars: config?.maxDocTitleChars ?? 256,
     maxFilenameChars: config?.maxFilenameChars ?? 256,
     maxDocTextChars: config?.maxDocTextChars ?? 2_000_000,
@@ -702,6 +704,34 @@ c.) Coalition building through service
     await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary TEXT;`);
     await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary_updated_at TIMESTAMPTZ;`);
 
+    // ====== MULTI-CHAT TABLES (global per user) ======
+    // Chat threads are independent of any single doc; messages are stored for UI.
+    // We use TEXT ids to avoid requiring Postgres extensions for UUID generation.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chats (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        openai_conversation_id TEXT NOT NULL,
+        archived_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await pool.query(`CREATE INDEX IF NOT EXISTS chats_user_id_updated_at_idx ON chats (user_id, updated_at);`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS chat_messages_chat_id_created_at_idx ON chat_messages (chat_id, created_at);`);
+
     // ----- Indexes & constraints (idempotent) -----
     // 1) Dedupe any legacy duplicates before adding unique index.
     await pool.query(`
@@ -730,6 +760,102 @@ c.) Coalition building through service
     await pool.query(
       `CREATE INDEX IF NOT EXISTS chat_history_doc_id_created_at_idx ON chat_history (doc_id, created_at);`
     );
+  }
+
+  // ====== MULTI-CHAT HELPERS ======
+
+  function requireUserId_(req, res, value) {
+    return requireNonEmptyTrimmedString(req, res, "userId", value, { maxChars: cfg.maxUserIdChars });
+  }
+
+  function requireChatId_(req, res, value) {
+    return requireNonEmptyTrimmedString(req, res, "chatId", value, { maxChars: 128 });
+  }
+
+  function normalizeChatTitle_(title, fallback) {
+    const s = String(title || "").replace(/\s+/g, " ").trim();
+    const base = s || String(fallback || "").replace(/\s+/g, " ").trim();
+    const clipped = base.slice(0, cfg.maxChatTitleChars);
+    return clipped || "New chat";
+  }
+
+  async function createChatThread_({ userId, title }) {
+    if (!client?.conversations || typeof client.conversations.create !== "function") {
+      throw new Error("OpenAI client missing conversations.create()");
+    }
+
+    const chatId = crypto.randomUUID();
+    const conv = await client.conversations.create({ metadata: { user_id: String(userId), chat_id: chatId } });
+    const conversationId = conv?.id;
+    if (!conversationId) {
+      throw new Error("Failed to create OpenAI conversation");
+    }
+
+    const safeTitle = normalizeChatTitle_(title, "New chat");
+
+    await pool.query(
+      `
+        INSERT INTO chats (id, user_id, title, openai_conversation_id)
+        VALUES ($1, $2, $3, $4)
+      `,
+      [String(chatId), String(userId), safeTitle, String(conversationId)]
+    );
+
+    return { chatId: String(chatId), title: safeTitle, conversationId: String(conversationId) };
+  }
+
+  async function getChatThreadForUser_({ chatId, userId }) {
+    const result = await pool.query(
+      `
+        SELECT id, user_id, title, openai_conversation_id, archived_at, created_at, updated_at
+        FROM chats
+        WHERE id = $1 AND user_id = $2
+        LIMIT 1
+      `,
+      [String(chatId), String(userId)]
+    );
+    return result.rows?.[0] || null;
+  }
+
+  async function appendChatMessage_({ chatId, role, content }) {
+    await pool.query(
+      `INSERT INTO chat_messages (chat_id, role, content) VALUES ($1, $2, $3)`,
+      [String(chatId), String(role), String(content || "")]
+    );
+    await pool.query(`UPDATE chats SET updated_at = NOW() WHERE id = $1`, [String(chatId)]);
+  }
+
+  async function maybeAutoTitleChat_({ chatId, existingTitle, firstUserMessage }) {
+    const current = String(existingTitle || "").trim();
+    if (current && current.toLowerCase() !== "new chat") return;
+    const auto = normalizeChatTitle_("", String(firstUserMessage || "").slice(0, 80));
+    await pool.query(`UPDATE chats SET title = $2, updated_at = NOW() WHERE id = $1`, [String(chatId), auto]);
+  }
+
+  async function resolveScopedVectorStoreIdForDoc_({ docId, fileId }) {
+    if (!docId) return null;
+    const session = await getOrCreateSession(String(docId), "");
+    if (!fileId) return { session, scopedVectorStoreId: null, scopedFileId: null };
+
+    const n = Number.parseInt(String(fileId), 10);
+    if (!Number.isFinite(n) || n <= 0) return { session, scopedVectorStoreId: null, scopedFileId: null };
+    const scopedFileId = n;
+
+    try {
+      const f = await pool.query(
+        `
+          SELECT file_vector_store_id
+          FROM docs_files
+          WHERE doc_id = $1 AND id = $2
+          LIMIT 1
+        `,
+        [String(docId), scopedFileId]
+      );
+      const scopedVectorStoreId = f.rows?.[0]?.file_vector_store_id || null;
+      return { session, scopedVectorStoreId, scopedFileId };
+    } catch (_) {
+      return { session, scopedVectorStoreId: null, scopedFileId: null };
+    }
   }
 
   async function recordVectorStoreFile(
@@ -1424,6 +1550,8 @@ c.) Coalition building through service
           maxDocIdChars: cfg.maxDocIdChars,
           maxUserMessageChars: cfg.maxUserMessageChars,
           maxInstructionsChars: cfg.maxInstructionsChars,
+          maxUserIdChars: cfg.maxUserIdChars,
+          maxChatTitleChars: cfg.maxChatTitleChars,
           maxDocTitleChars: cfg.maxDocTitleChars,
           maxFilenameChars: cfg.maxFilenameChars,
           maxDocTextChars: cfg.maxDocTextChars,
@@ -1547,6 +1675,311 @@ c.) Coalition building through service
     } catch (err) {
       logger.error(err);
       return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  // ====== V2 CHATS (global, per user) ======
+  // Sidebar chat threads like ChatGPT.
+
+  app.get("/v2/chats", async (req, res) => {
+    try {
+      const userId = requireUserId_(req, res, req.query?.userId);
+      if (userId == null) return;
+
+      const includeArchived = (() => {
+        const raw = req.query?.includeArchived;
+        if (raw == null) return false;
+        const s = String(raw).trim().toLowerCase();
+        return s === "1" || s === "true" || s === "yes" || s === "on";
+      })();
+
+      const limit = (() => {
+        const raw = req.query?.limit;
+        const n = Number.parseInt(String(raw ?? ""), 10);
+        if (!Number.isFinite(n) || n <= 0) return 50;
+        return Math.min(200, n);
+      })();
+
+      const result = await pool.query(
+        `
+          SELECT id, title, archived_at, created_at, updated_at
+          FROM chats
+          WHERE user_id = $1
+            AND ($2::boolean OR archived_at IS NULL)
+          ORDER BY updated_at DESC
+          LIMIT $3
+        `,
+        [String(userId), Boolean(includeArchived), limit]
+      );
+
+      return res.json({
+        ok: true,
+        userId: String(userId),
+        chats: (result.rows || []).map((r) => ({
+          id: r.id,
+          title: r.title,
+          archivedAt: r.archived_at,
+          createdAt: r.created_at,
+          updatedAt: r.updated_at,
+        })),
+      });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  app.post("/v2/chats", async (req, res) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const userId = requireUserId_(req, res, req.body.userId);
+      if (userId == null) return;
+
+      const title = typeof req.body.title === "undefined" ? "" : requireString(req, res, "title", req.body.title, { maxChars: cfg.maxChatTitleChars, allowEmpty: true });
+      if (title == null) return;
+
+      const created = await createChatThread_({ userId: String(userId), title: String(title || "") });
+      return res.json({ ok: true, userId: String(userId), chat: { id: created.chatId, title: created.title } });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, err.message || "Server error"));
+    }
+  });
+
+  app.patch("/v2/chats/:chatId", async (req, res) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const chatId = requireChatId_(req, res, req.params?.chatId);
+      if (chatId == null) return;
+
+      const userId = requireUserId_(req, res, req.body.userId);
+      if (userId == null) return;
+
+      const title = requireNonEmptyTrimmedString(req, res, "title", req.body.title, { maxChars: cfg.maxChatTitleChars });
+      if (title == null) return;
+
+      const existing = await getChatThreadForUser_({ chatId: String(chatId), userId: String(userId) });
+      if (!existing) {
+        return res.status(404).json(jsonError(req, "Chat not found"));
+      }
+
+      await pool.query(`UPDATE chats SET title = $3, updated_at = NOW() WHERE id = $1 AND user_id = $2`, [String(chatId), String(userId), String(title)]);
+      return res.json({ ok: true, chat: { id: String(chatId), title: String(title) } });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  app.post("/v2/chats/:chatId/archive", async (req, res) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const chatId = requireChatId_(req, res, req.params?.chatId);
+      if (chatId == null) return;
+
+      const userId = requireUserId_(req, res, req.body.userId);
+      if (userId == null) return;
+
+      const existing = await getChatThreadForUser_({ chatId: String(chatId), userId: String(userId) });
+      if (!existing) {
+        return res.status(404).json(jsonError(req, "Chat not found"));
+      }
+
+      await pool.query(`UPDATE chats SET archived_at = NOW(), updated_at = NOW() WHERE id = $1 AND user_id = $2`, [String(chatId), String(userId)]);
+      return res.json({ ok: true, chat: { id: String(chatId), archived: true } });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  app.get("/v2/chats/:chatId/messages", async (req, res) => {
+    try {
+      const chatId = requireChatId_(req, res, req.params?.chatId);
+      if (chatId == null) return;
+
+      const userId = requireUserId_(req, res, req.query?.userId);
+      if (userId == null) return;
+
+      const existing = await getChatThreadForUser_({ chatId: String(chatId), userId: String(userId) });
+      if (!existing) {
+        return res.status(404).json(jsonError(req, "Chat not found"));
+      }
+
+      const limit = (() => {
+        const raw = req.query?.limit;
+        const n = Number.parseInt(String(raw ?? ""), 10);
+        if (!Number.isFinite(n) || n <= 0) return 200;
+        return Math.min(500, n);
+      })();
+
+      const result = await pool.query(
+        `
+          SELECT id, role, content, created_at
+          FROM chat_messages
+          WHERE chat_id = $1
+          ORDER BY created_at ASC, id ASC
+          LIMIT $2
+        `,
+        [String(chatId), limit]
+      );
+
+      return res.json({
+        ok: true,
+        userId: String(userId),
+        chat: {
+          id: existing.id,
+          title: existing.title,
+          archivedAt: existing.archived_at,
+          createdAt: existing.created_at,
+          updatedAt: existing.updated_at,
+        },
+        messages: (result.rows || []).map((r) => ({
+          id: r.id,
+          role: r.role,
+          content: r.content,
+          createdAt: r.created_at,
+        })),
+      });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+
+  app.post("/v2/chats/:chatId/send", async (req, res) => {
+    try {
+      const started = Date.now();
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json(jsonError(req, "Invalid JSON body"));
+      }
+
+      const chatId = requireChatId_(req, res, req.params?.chatId);
+      if (chatId == null) return;
+
+      const userId = requireUserId_(req, res, req.body.userId);
+      if (userId == null) return;
+
+      const userMessage = requireNonEmptyTrimmedString(req, res, "userMessage", req.body.userMessage, { maxChars: cfg.maxUserMessageChars });
+      if (userMessage == null) return;
+
+      const instructions = typeof req.body.instructions === "undefined" ? "" : requireString(req, res, "instructions", req.body.instructions, { maxChars: cfg.maxInstructionsChars, allowEmpty: true });
+      if (instructions == null) return;
+
+      const docId = typeof req.body.docId === "undefined" ? "" : requireString(req, res, "docId", req.body.docId, { maxChars: cfg.maxDocIdChars, allowEmpty: true });
+      if (docId == null) return;
+
+      const fileId = typeof req.body.fileId === "undefined" ? "" : requireString(req, res, "fileId", req.body.fileId, { maxChars: 64, allowEmpty: true });
+      if (fileId == null) return;
+
+      const chat = await getChatThreadForUser_({ chatId: String(chatId), userId: String(userId) });
+      if (!chat) {
+        return res.status(404).json(jsonError(req, "Chat not found"));
+      }
+      if (chat.archived_at) {
+        return res.status(400).json(jsonError(req, "Chat is archived"));
+      }
+
+      const msgStr = String(userMessage || "");
+
+      // Persist user message first.
+      await appendChatMessage_({ chatId: String(chatId), role: "user", content: msgStr });
+      await maybeAutoTitleChat_({ chatId: String(chatId), existingTitle: chat.title, firstUserMessage: msgStr });
+
+      const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
+      if (askedModel) {
+        const replyText = `A backend szerint ezzel a modellel hívlak: ${cfg.openaiModel}`;
+        await appendChatMessage_({ chatId: String(chatId), role: "assistant", content: replyText });
+        return res.json({
+          ok: true,
+          chatId: String(chatId),
+          reply: replyText,
+          responseId: "local-model-info",
+          sources: [],
+        });
+      }
+
+      // Optional doc context: use doc vector store for retrieval and summary.
+      let scopedVectorStoreId = null;
+      let scopedFileId = null;
+      let session = null;
+      if (String(docId || "").trim()) {
+        const resolved = await resolveScopedVectorStoreIdForDoc_({ docId: String(docId), fileId: String(fileId || "").trim() });
+        session = resolved.session;
+        scopedVectorStoreId = resolved.scopedVectorStoreId;
+        scopedFileId = resolved.scopedFileId;
+
+        // Ensure session uses the requested instructions (updates docs_sessions if changed).
+        if (typeof instructions === "string" && instructions.trim() !== String(session.instructions || "").trim()) {
+          session = await getOrCreateSession(String(docId), String(instructions));
+        }
+      }
+
+      const useTools = Boolean(session && (scopedVectorStoreId || session.vector_store_id));
+      const response = await client.responses.create({
+        model: cfg.openaiModel,
+        conversation: String(chat.openai_conversation_id),
+        instructions: session ? buildInstructions(session.instructions, session.doc_summary) : SYSTEM_PROMPT,
+        tools: useTools
+          ? [
+              {
+                type: "file_search",
+                vector_store_ids: [scopedVectorStoreId || session.vector_store_id],
+              },
+            ]
+          : [],
+        input: msgStr,
+        max_output_tokens: cfg.maxOutputTokens,
+      });
+
+      const replyText = String(response.output_text || "").trim();
+      await appendChatMessage_({ chatId: String(chatId), role: "assistant", content: replyText });
+
+      const usedSources = extractSourcesFromResponse_(response);
+      const sourceFileIds = usedSources.map((s) => s.fileId).filter(Boolean);
+      const fileMeta = session ? await resolveSourceMetadata_(String(docId), sourceFileIds) : new Map();
+      const sources = usedSources.map((s) => {
+        const meta = fileMeta.get(String(s.fileId)) || {};
+        const section = extractSectionFromQuote_(s.quote);
+        return {
+          fileId: s.fileId,
+          filename: meta.filename,
+          kind: meta.kind,
+          section,
+          snippet: clipSnippet(s.quote),
+        };
+      });
+
+      logChatEvent_({
+        chatId: String(chatId),
+        docId: String(docId || "") || null,
+        scope: scopedVectorStoreId ? "file" : session ? "all" : "none",
+        fileId: scopedFileId || null,
+        model: cfg.openaiModel,
+        usedSources: sources.length,
+        usage: response?.usage || {},
+        latencyMs: Date.now() - started,
+      });
+
+      return res.json({
+        ok: true,
+        chatId: String(chatId),
+        reply: replyText,
+        responseId: response.id,
+        sources,
+      });
+    } catch (err) {
+      logger.error(err);
+      return res.status(500).json(jsonError(req, err.message || "Server error"));
     }
   });
 
