@@ -8,17 +8,23 @@
  */
 
 function onOpen() {
-  DocumentApp.getUi().createMenu('Assistant')
-    .addItem('Open Chat Sidebar', 'showChatSidebar')
-    .addItem('Open Chat (wide window)', 'showChatDialog')
-    .addItem('Reset Doc Assist (this document)', 'resetDocAssistForThisDocument')
-    .addItem('Reset Server State (this document)', 'resetServerStateForThisDocumentMenu')
-    .addSeparator()
-    .addItem('Sync Document to Knowledge', 'syncDocumentToKnowledge')
-    .addSeparator()
-    .addItem('Process Selected Text (legacy)', 'processSelection')
-    .addItem('Chat with Document (legacy)', 'chatWithDocument')
-    .addToUi();
+  try {
+    const ui = DocumentApp.getUi();
+    ui.createMenu('Assistant')
+      .addItem('Open Chat Sidebar', 'showChatSidebar')
+      .addItem('Open Chat (wide window)', 'showChatDialog')
+      .addItem('Reset Doc Assist (this document)', 'resetDocAssistForThisDocument')
+      .addItem('Reset Server State (this document)', 'resetServerStateForThisDocumentMenu')
+      .addSeparator()
+      .addItem('Sync Document to Knowledge', 'syncDocumentToKnowledge')
+      .addSeparator()
+      .addItem('Process Selected Text (legacy)', 'processSelection')
+      .addItem('Chat with Document (legacy)', 'chatWithDocument')
+      .addToUi();
+  } catch (e) {
+    // Running from Apps Script editor or other non-UI contexts will throw.
+    log_('on_open.no_ui', { message: e && e.message ? e.message : String(e) });
+  }
 }
 
 function resetDocAssistForThisDocument() {
@@ -245,6 +251,22 @@ function getChatSidebarHtml_() {
           <button id="insertMdBtn" title="Insert the most recent Assistant reply with basic Markdown formatting">Insert last reply (Markdown)</button>
         </div>
       </div>
+
+      <div class="row">
+        <details id="mdPasteDetails">
+          <summary>Paste Markdown into document</summary>
+          <div class="details-body">
+            <textarea id="mdPaste" placeholder="Paste Markdown here (e.g., from ChatGPT, GitHub, etc.)"></textarea>
+            <div class="controls" style="margin-top:6px;">
+              <button id="mdPasteClipboardBtn" title="Reads text from your clipboard (if allowed)">Paste from clipboard</button>
+              <button id="mdPastePreviewBtn">Preview</button>
+              <button id="mdPasteInsertBtn" class="primary">Insert Markdown into Doc</button>
+            </div>
+            <div class="small">Inserts at cursor (or appends at the end). Uses the same Markdown formatter as “Insert last reply (Markdown)”.</div>
+            <div id="mdPastePreview" class="chat" style="height:160px; background:#fff;"></div>
+          </div>
+        </details>
+      </div>
     </div>
 
     <div class="row controls">
@@ -469,6 +491,70 @@ function getChatSidebarHtml_() {
 
       function setStatus(text) {
         el('status').textContent = text || '';
+      }
+
+      function pollJobUntilDone_(jobId, label, onDone) {
+        const started = Date.now();
+        const id = String(jobId || '').trim();
+        if (!id) {
+          onDone(new Error('Missing jobId.'));
+          return;
+        }
+
+        const tick = () => {
+          google.script.run
+            .withSuccessHandler((resp) => {
+              const status = resp && resp.status ? String(resp.status) : 'unknown';
+              if (status === 'succeeded') {
+                onDone(null, resp);
+                return;
+              }
+              if (status === 'failed') {
+                const errMsg = resp && resp.error ? String(resp.error) : 'Job failed.';
+                onDone(new Error(errMsg), resp);
+                return;
+              }
+
+              const elapsedSec = Math.max(0, Math.round((Date.now() - started) / 1000));
+              setStatus((label || 'Sync') + ' running… ' + elapsedSec + 's');
+              setTimeout(tick, 1500);
+            })
+            .withFailureHandler((err) => {
+              const msg = err && err.message ? err.message : err;
+              setStatus((label || 'Sync') + ' status check failed: ' + msg + ' (retrying)');
+              setTimeout(tick, 2500);
+            })
+            .getJobStatus(id);
+        };
+
+        tick();
+      }
+
+      function pollJobsSequentially_(jobs, onDone) {
+        const list = Array.isArray(jobs) ? jobs : [];
+        let index = 0;
+
+        const next = () => {
+          if (index >= list.length) {
+            onDone(null);
+            return;
+          }
+
+          const item = list[index];
+          index += 1;
+          const title = item && item.tabTitle ? String(item.tabTitle) : 'tab';
+          const label = 'Syncing ' + title + ' (' + index + '/' + list.length + ')';
+
+          pollJobUntilDone_(item && item.jobId ? item.jobId : '', label, (err) => {
+            if (err) {
+              onDone(err);
+              return;
+            }
+            next();
+          });
+        };
+
+        next();
       }
 
       function setActiveChatUi_(chatId, title) {
@@ -708,7 +794,73 @@ function getChatSidebarHtml_() {
         ['saveSettingsBtn','resetServerBtn','cleanupOpenaiBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope','newChatBtn','renameChatBtn','archiveChatBtn'].forEach(id => {
           try { el(id).disabled = disabled; } catch (e) {}
         });
+
+        ['mdPaste','mdPasteClipboardBtn','mdPastePreviewBtn','mdPasteInsertBtn'].forEach(id => {
+          try { el(id).disabled = disabled; } catch (e) {}
+        });
       }
+
+      function updateMdPastePreview_() {
+        try {
+          const md = el('mdPaste') ? String(el('mdPaste').value || '') : '';
+          const prev = el('mdPastePreview');
+          if (!prev) return;
+          prev.innerHTML = md.trim() ? renderMarkdown(md) : '<div class="small">(nothing to preview)</div>';
+        } catch (e) {
+          try {
+            const prev = el('mdPastePreview');
+            if (prev) prev.textContent = '(preview failed)';
+          } catch (err) {}
+        }
+      }
+
+      el('mdPastePreviewBtn').addEventListener('click', () => updateMdPastePreview_());
+      el('mdPaste').addEventListener('input', () => {
+        // Keep it responsive without overdoing it.
+        try { updateMdPastePreview_(); } catch (e) {}
+      });
+
+      el('mdPasteClipboardBtn').addEventListener('click', async () => {
+        try {
+          if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+            const t = await navigator.clipboard.readText();
+            if (el('mdPaste')) el('mdPaste').value = t || '';
+            updateMdPastePreview_();
+            setStatus('Pasted from clipboard.');
+            return;
+          }
+          setStatus('Clipboard API not available here. Paste manually into the box.');
+        } catch (e) {
+          setStatus('Clipboard read failed. Paste manually into the box.');
+        }
+      });
+
+      el('mdPasteInsertBtn').addEventListener('click', () => {
+        try {
+          const md = el('mdPaste') ? String(el('mdPaste').value || '') : '';
+          if (!md.trim()) {
+            setStatus('Nothing to insert.');
+            return;
+          }
+
+          disableAll(true);
+          setStatus('Inserting Markdown into doc...');
+
+          google.script.run
+            .withSuccessHandler(() => {
+              setStatus('Inserted Markdown into doc.');
+              disableAll(false);
+            })
+            .withFailureHandler((err) => {
+              setStatus('Insert failed: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+            })
+            .insertMarkdownIntoDocFromSidebar(md);
+        } catch (e) {
+          setStatus('Insert failed: ' + (e && e.message ? e.message : e));
+          try { disableAll(false); } catch (err) {}
+        }
+      });
 
       el('newChatBtn').addEventListener('click', () => {
         disableAll(true);
@@ -1030,9 +1182,24 @@ function getChatSidebarHtml_() {
         disableAll(true);
         setStatus('Syncing tab...');
         google.script.run.withSuccessHandler(() => {
-          setStatus('Tab synced.');
-          try { refreshFiles_(); } catch (e) {}
-          disableAll(false);
+          const jobId = resp && resp.jobId ? String(resp.jobId) : '';
+          if (!jobId) {
+            setStatus('Tab synced.');
+            try { refreshFiles_(); } catch (e) {}
+            disableAll(false);
+            return;
+          }
+
+          pollJobUntilDone_(jobId, 'Syncing tab', (err) => {
+            if (err) {
+              setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+              return;
+            }
+            setStatus('Tab synced.');
+            try { refreshFiles_(); } catch (e) {}
+            disableAll(false);
+          });
         }).withFailureHandler((err) => {
           setStatus('Error syncing document: ' + (err && err.message ? err.message : err));
           disableAll(false);
@@ -1048,9 +1215,24 @@ function getChatSidebarHtml_() {
         disableAll(true);
         setStatus('Syncing all tabs...');
         google.script.run.withSuccessHandler(() => {
-          setStatus('All tabs synced.');
-          try { refreshFiles_(); } catch (e) {}
-          disableAll(false);
+          const jobs = resp && Array.isArray(resp.jobs) ? resp.jobs : [];
+          if (!jobs.length) {
+            setStatus('All tabs synced.');
+            try { refreshFiles_(); } catch (e) {}
+            disableAll(false);
+            return;
+          }
+
+          pollJobsSequentially_(jobs, (err) => {
+            if (err) {
+              setStatus('Error syncing tabs: ' + (err && err.message ? err.message : err));
+              disableAll(false);
+              return;
+            }
+            setStatus('All tabs synced.');
+            try { refreshFiles_(); } catch (e) {}
+            disableAll(false);
+          });
         }).withFailureHandler((err) => {
           setStatus('Error syncing tabs: ' + (err && err.message ? err.message : err));
           disableAll(false);
@@ -1895,14 +2077,19 @@ function syncDocumentToKnowledge(instructionsOverride, replaceKnowledge, tabIdOv
     tabTextLen: String(tabText || '').length,
     instructionsLen: String(instructions || '').length,
     replaceKnowledge: Boolean(replaceKnowledge),
-    reused: Boolean(resp && resp.reused),
+    jobId: resp && resp.jobId ? String(resp.jobId) : '',
     activeTabId: activeTabId,
     requestedTabId: requestedTabId,
     usedFallbackFirstTab: Boolean(!requestedTabId && (!activeTabId || activeTabId !== chosen.tabId)),
     ms: Date.now() - started
   });
 
-  return resp;
+  return {
+    jobId: resp && resp.jobId ? String(resp.jobId) : '',
+    tabId: chosen.tabId,
+    tabTitle: chosen.title || '',
+    status: resp && resp.status ? String(resp.status) : ''
+  };
 }
 
 function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge, fileScopeEnabled) {
@@ -1919,6 +2106,7 @@ function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge, fileScop
   let replaceApplied = false;
   let synced = 0;
   let skippedEmpty = 0;
+  const jobs = [];
 
   for (const t of tabs) {
     const text = t && t.text ? String(t.text) : '';
@@ -1941,13 +2129,21 @@ function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge, fileScop
     synced += 1;
     if (rk) replaceApplied = true;
 
+    if (resp && resp.jobId) {
+      jobs.push({
+        jobId: String(resp.jobId),
+        tabId: String(t.tabId),
+        tabTitle: t.title || ''
+      });
+    }
+
     log_('v2.sync_tab.batch_item', {
       docId: doc.getId(),
       tabId: String(t.tabId),
       tabTitle: t.title || '',
       tabTextLen: String(text || '').length,
       replaceKnowledge: rk,
-      reused: Boolean(resp && resp.reused)
+      jobId: resp && resp.jobId ? String(resp.jobId) : ''
     });
   }
 
@@ -1961,7 +2157,13 @@ function syncAllTabsToKnowledge(instructionsOverride, replaceKnowledge, fileScop
     ms: Date.now() - started
   });
 
-  return { ok: true, tabsTotal: tabs.length, synced: synced, skippedEmpty: skippedEmpty };
+  return { ok: true, tabsTotal: tabs.length, synced: synced, skippedEmpty: skippedEmpty, jobs: jobs };
+}
+
+function getJobStatus(jobId) {
+  const id = String(jobId || '').trim();
+  if (!id) throw new Error('Missing jobId.');
+  return callBackendV2Get_('/v2/jobs/' + encodeURIComponent(id));
 }
 
 function uploadFileToKnowledge(filename, mimeType, contentBase64, instructionsOverride, replaceKnowledge) {

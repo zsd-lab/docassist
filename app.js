@@ -19,6 +19,7 @@ export function createApp({
   const cfg = {
     bodyLimit: config?.bodyLimit || process.env.DOCASSIST_BODY_LIMIT || "25mb",
     token: config?.token ?? process.env.DOCASSIST_TOKEN ?? "",
+    jobTtlMs: config?.jobTtlMs ?? 60 * 60 * 1000,
     resetCleanupOpenAI: (() => {
       const raw = config?.resetCleanupOpenAI ?? process.env.DOCASSIST_RESET_CLEANUP_OPENAI;
       if (raw == null) return false;
@@ -121,6 +122,68 @@ export function createApp({
       return s === "1" || s === "true" || s === "yes" || s === "on";
     })(),
   };
+
+  const jobs = new Map();
+
+  function nowIso_() {
+    return new Date().toISOString();
+  }
+
+  function pruneJobs_() {
+    const ttl = Number(cfg.jobTtlMs) || 60 * 60 * 1000;
+    const now = Date.now();
+    for (const [id, job] of jobs.entries()) {
+      const updatedAt = new Date(job.updatedAt || job.createdAt || now).getTime();
+      if (!updatedAt || now - updatedAt > ttl) {
+        jobs.delete(id);
+      }
+    }
+  }
+
+  function createJob_(kind, meta = {}) {
+    pruneJobs_();
+    const id = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex");
+    const job = {
+      id,
+      kind: String(kind || "job"),
+      status: "queued",
+      createdAt: nowIso_(),
+      updatedAt: nowIso_(),
+      meta,
+    };
+    jobs.set(id, job);
+    return job;
+  }
+
+  function updateJob_(id, patch) {
+    const job = jobs.get(id);
+    if (!job) return null;
+    Object.assign(job, patch, { updatedAt: nowIso_() });
+    return job;
+  }
+
+  function getJob_(id) {
+    pruneJobs_();
+    return jobs.get(id) || null;
+  }
+
+  function runJob_(id, fn) {
+    updateJob_(id, { status: "running" });
+    Promise.resolve()
+      .then(fn)
+      .then((result) => {
+        updateJob_(id, { status: "succeeded", result });
+      })
+      .catch((err) => {
+        logger.error(err);
+        updateJob_(id, {
+          status: "failed",
+          error: err?.message || String(err || "Job failed"),
+        });
+      });
+  }
 
   const client = openaiClient ||
     new OpenAI({
@@ -2349,162 +2412,198 @@ c.) Coalition building through service
         return !(s === "0" || s === "false" || s === "no" || s === "off");
       })();
 
-      const session = await getOrCreateSession(
-        String(docId),
-        typeof instructions === "string" ? instructions : ""
-      );
-
-      if (replaceKnowledge) {
-        await bestEffortReplaceKnowledgeForDoc_({
-          docId: String(docId),
-          vectorStoreId: session.vector_store_id,
-        });
+      if (!String(tabText || "").trim()) {
+        return res.status(400).json(jsonError(req, "This tab is empty."));
       }
 
-      const safeTabTitle = String(tabTitle || "tab").replace(/[^a-zA-Z0-9._-]+/g, "_");
-      const safeTabId = String(tabId).replace(/[^a-zA-Z0-9._-]+/g, "_");
-      const safeDocPrefix = String(docId).slice(0, 8);
-      let tabEntryFilename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${safeDocPrefix}.txt`;
-      if (tabEntryFilename.length > cfg.maxFilenameChars) {
-        tabEntryFilename = tabEntryFilename.slice(0, cfg.maxFilenameChars);
-      }
+      const job = createJob_("sync-tab", { docId: String(docId), tabId: String(tabId) });
 
-      const formatted = normalizeStructuredText(tabText);
-      if (!formatted) {
-        throw new Error("This tab is empty.");
-      }
-
-      // Hash includes tabId to avoid cross-tab dedupe collisions.
-      const tabHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${formatted}`, "utf8"));
-
-      if (!replaceKnowledge) {
-        const existingTab = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
-        if (existingTab?.vector_store_file_id) {
-          return res.json({
-            vectorStoreFileId: existingTab.vector_store_file_id,
-            docsFileId: existingTab.id,
-            reused: true,
-            hasFileScope: Boolean(existingTab.file_vector_store_id),
-          });
-        }
-      }
-
-      let fileVectorStoreId = null;
-      if (fileScopeEnabled) {
-        const fileVectorStore = await client.vectorStores.create({
-          name: `docassist-${String(docId)}-tab-${tabHash.slice(0, 12)}`,
-          metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: tabHash },
-        });
-        fileVectorStoreId = fileVectorStore?.id;
-      }
-
-      const chunks = cfg.chunkingEnabled
-        ? buildChunksFromStructuredText(formatted, {
-            maxTokens: cfg.chunkMaxTokens,
-            overlapTokens: cfg.chunkOverlapTokens,
-          })
-        : [{ sectionPath: "", text: formatted }];
-
-      if (!chunks.length) {
-        throw new Error("No content to sync.");
-      }
-
-      let firstDocVsfId = null;
-      let firstFileScopeVsfId = null;
-      let firstDocVsfFileId = null;
-      let firstFileScopeVsfFileId = null;
-
-      for (let i = 0; i < chunks.length; i += 1) {
-        const chunk = chunks[i];
-        const chunkText = String(chunk.text || "").trim();
-        if (!chunkText) continue;
-
-        const chunkHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${chunkText}`, "utf8"));
-        const chunkKind = "tab_chunk";
-        const sectionSlug = slugifyForFilename(chunk.sectionPath || `part-${i + 1}`);
-        let chunkFilename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${sectionSlug}__part-${i + 1}.txt`;
-        if (chunkFilename.length > cfg.maxFilenameChars) {
-          chunkFilename = chunkFilename.slice(0, cfg.maxFilenameChars);
-        }
-
-        let docVsfId = null;
-        let docVsfFileId = null;
-        if (!replaceKnowledge) {
-          const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
-          docVsfId = existingChunk?.vector_store_file_id || null;
-          docVsfFileId = existingChunk?.vector_store_file_file_id || null;
-        }
-
-        if (!docVsfId) {
-          const uploadableChunk = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
-            type: "text/plain",
-          });
-          const vsFile = await client.vectorStores.files.uploadAndPoll(
-            session.vector_store_id,
-            uploadableChunk
+      setImmediate(() => {
+        runJob_(job.id, async () => {
+          const session = await getOrCreateSession(
+            String(docId),
+            typeof instructions === "string" ? instructions : ""
           );
-          docVsfId = vsFile.id;
-          docVsfFileId = vsFile?.file_id || vsFile?.fileId || null;
-        }
 
-        let fileScopeVsf = null;
-        let fileScopeVsfFileId = null;
-        if (fileScopeEnabled && fileVectorStoreId) {
-          const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
-            type: "text/plain",
+          if (replaceKnowledge) {
+            await bestEffortReplaceKnowledgeForDoc_({
+              docId: String(docId),
+              vectorStoreId: session.vector_store_id,
+            });
+          }
+
+          const safeTabTitle = String(tabTitle || "tab").replace(/[^a-zA-Z0-9._-]+/g, "_");
+          const safeTabId = String(tabId).replace(/[^a-zA-Z0-9._-]+/g, "_");
+          const safeDocPrefix = String(docId).slice(0, 8);
+          let tabEntryFilename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${safeDocPrefix}.txt`;
+          if (tabEntryFilename.length > cfg.maxFilenameChars) {
+            tabEntryFilename = tabEntryFilename.slice(0, cfg.maxFilenameChars);
+          }
+
+          const formatted = normalizeStructuredText(tabText);
+          if (!formatted) {
+            throw new Error("This tab is empty.");
+          }
+
+          // Hash includes tabId to avoid cross-tab dedupe collisions.
+          const tabHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${formatted}`, "utf8"));
+
+          if (!replaceKnowledge) {
+            const existingTab = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
+            if (existingTab?.vector_store_file_id) {
+              return {
+                vectorStoreFileId: existingTab.vector_store_file_id,
+                docsFileId: existingTab.id,
+                reused: true,
+                hasFileScope: Boolean(existingTab.file_vector_store_id),
+              };
+            }
+          }
+
+          let fileVectorStoreId = null;
+          if (fileScopeEnabled) {
+            const fileVectorStore = await client.vectorStores.create({
+              name: `docassist-${String(docId)}-tab-${tabHash.slice(0, 12)}`,
+              metadata: { doc_id: String(docId), kind: "tab", tab_id: String(tabId), sha256: tabHash },
+            });
+            fileVectorStoreId = fileVectorStore?.id;
+          }
+
+          const chunks = cfg.chunkingEnabled
+            ? buildChunksFromStructuredText(formatted, {
+                maxTokens: cfg.chunkMaxTokens,
+                overlapTokens: cfg.chunkOverlapTokens,
+              })
+            : [{ sectionPath: "", text: formatted }];
+
+          if (!chunks.length) {
+            throw new Error("No content to sync.");
+          }
+
+          let firstDocVsfId = null;
+          let firstFileScopeVsfId = null;
+          let firstDocVsfFileId = null;
+          let firstFileScopeVsfFileId = null;
+
+          for (let i = 0; i < chunks.length; i += 1) {
+            const chunk = chunks[i];
+            const chunkText = String(chunk.text || "").trim();
+            if (!chunkText) continue;
+
+            const chunkHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${chunkText}`, "utf8"));
+            const chunkKind = "tab_chunk";
+            const sectionSlug = slugifyForFilename(chunk.sectionPath || `part-${i + 1}`);
+            let chunkFilename = `tab_${safeTabTitle || "tab"}_${safeTabId}_${sectionSlug}__part-${i + 1}.txt`;
+            if (chunkFilename.length > cfg.maxFilenameChars) {
+              chunkFilename = chunkFilename.slice(0, cfg.maxFilenameChars);
+            }
+
+            let docVsfId = null;
+            let docVsfFileId = null;
+            if (!replaceKnowledge) {
+              const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
+              docVsfId = existingChunk?.vector_store_file_id || null;
+              docVsfFileId = existingChunk?.vector_store_file_file_id || null;
+            }
+
+            if (!docVsfId) {
+              const uploadableChunk = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+                type: "text/plain",
+              });
+              const vsFile = await client.vectorStores.files.uploadAndPoll(
+                session.vector_store_id,
+                uploadableChunk
+              );
+              docVsfId = vsFile.id;
+              docVsfFileId = vsFile?.file_id || vsFile?.fileId || null;
+            }
+
+            let fileScopeVsf = null;
+            let fileScopeVsfFileId = null;
+            if (fileScopeEnabled && fileVectorStoreId) {
+              const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+                type: "text/plain",
+              });
+              fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+                fileVectorStoreId,
+                uploadableFileScope
+              );
+              fileScopeVsfFileId = fileScopeVsf?.file_id || fileScopeVsf?.fileId || null;
+            }
+
+            await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
+              fileVectorStoreId: fileVectorStoreId,
+              fileVectorStoreFileId: fileScopeVsf?.id || null,
+              vectorStoreFileFileId: docVsfFileId,
+              fileVectorStoreFileFileId: fileScopeVsfFileId,
+            });
+
+            if (!firstDocVsfId) {
+              firstDocVsfId = docVsfId;
+              firstFileScopeVsfId = fileScopeVsf?.id || null;
+              firstDocVsfFileId = docVsfFileId;
+              firstFileScopeVsfFileId = fileScopeVsfFileId;
+            }
+          }
+
+          if (!firstDocVsfId) {
+            throw new Error("No content to sync.");
+          }
+
+          await recordVectorStoreFile(String(docId), "tab", tabEntryFilename, tabHash, firstDocVsfId, {
+            fileVectorStoreId: fileVectorStoreId,
+            fileVectorStoreFileId: firstFileScopeVsfId,
+            vectorStoreFileFileId: firstDocVsfFileId,
+            fileVectorStoreFileFileId: firstFileScopeVsfFileId,
           });
-          fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
+
+          try {
+            await updateDocSummary_({
+              docId: String(docId),
+              title: String(tabTitle || ""),
+              kind: "tab",
+              text: formatted,
+              previousSummary: session.doc_summary,
+            });
+          } catch (e) {
+            logger.error(e);
+          }
+
+          // Best-effort: fetch docs_files id for UI convenience.
+          const created = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
+          return {
+            vectorStoreFileId: firstDocVsfId,
+            docsFileId: created?.id,
             fileVectorStoreId,
-            uploadableFileScope
-          );
-          fileScopeVsfFileId = fileScopeVsf?.file_id || fileScopeVsf?.fileId || null;
-        }
-
-        await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
-          fileVectorStoreId: fileVectorStoreId,
-          fileVectorStoreFileId: fileScopeVsf?.id || null,
-          vectorStoreFileFileId: docVsfFileId,
-          fileVectorStoreFileFileId: fileScopeVsfFileId,
+            reused: false,
+          };
         });
-
-        if (!firstDocVsfId) {
-          firstDocVsfId = docVsfId;
-          firstFileScopeVsfId = fileScopeVsf?.id || null;
-          firstDocVsfFileId = docVsfFileId;
-          firstFileScopeVsfFileId = fileScopeVsfFileId;
-        }
-      }
-
-      if (!firstDocVsfId) {
-        throw new Error("No content to sync.");
-      }
-
-      await recordVectorStoreFile(String(docId), "tab", tabEntryFilename, tabHash, firstDocVsfId, {
-        fileVectorStoreId: fileVectorStoreId,
-        fileVectorStoreFileId: firstFileScopeVsfId,
-        vectorStoreFileFileId: firstDocVsfFileId,
-        fileVectorStoreFileFileId: firstFileScopeVsfFileId,
       });
 
-      try {
-        await updateDocSummary_({
-          docId: String(docId),
-          title: String(tabTitle || ""),
-          kind: "tab",
-          text: formatted,
-          previousSummary: session.doc_summary,
-        });
-      } catch (e) {
-        logger.error(e);
-      }
+      return res.json({ jobId: job.id, status: job.status });
+    } catch (err) {
+      logger.error(err);
+      return res
+        .status(500)
+        .json(jsonError(req, err.message || "Internal server error"));
+    }
+  });
 
-      // Best-effort: fetch docs_files id for UI convenience.
-      const created = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
+  app.get("/v2/jobs/:jobId", async (req, res) => {
+    try {
+      const jobId = String(req.params?.jobId || "").trim();
+      if (!jobId) return res.status(400).json(jsonError(req, "Missing jobId"));
+
+      const job = getJob_(jobId);
+      if (!job) return res.status(404).json(jsonError(req, "Job not found"));
+
       return res.json({
-        vectorStoreFileId: firstDocVsfId,
-        docsFileId: created?.id,
-        fileVectorStoreId,
-        reused: false,
+        jobId: job.id,
+        status: job.status,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        result: job.status === "succeeded" ? job.result : undefined,
+        error: job.status === "failed" ? job.error : undefined,
       });
     } catch (err) {
       logger.error(err);
