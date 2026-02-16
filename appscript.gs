@@ -506,6 +506,7 @@ function getChatSidebarHtml_() {
             .withSuccessHandler((resp) => {
               const status = resp && resp.status ? String(resp.status) : 'unknown';
               if (status === 'succeeded') {
+                setStatus((label || 'Sync') + ' completed.');
                 onDone(null, resp);
                 return;
               }
@@ -1181,7 +1182,7 @@ function getChatSidebarHtml_() {
       el('syncBtn').addEventListener('click', () => {
         disableAll(true);
         setStatus('Syncing tab...');
-        google.script.run.withSuccessHandler(() => {
+        google.script.run.withSuccessHandler((resp) => {
           const jobId = resp && resp.jobId ? String(resp.jobId) : '';
           if (!jobId) {
             setStatus('Tab synced.');
@@ -1214,7 +1215,7 @@ function getChatSidebarHtml_() {
       el('syncAllBtn').addEventListener('click', () => {
         disableAll(true);
         setStatus('Syncing all tabs...');
-        google.script.run.withSuccessHandler(() => {
+        google.script.run.withSuccessHandler((resp) => {
           const jobs = resp && Array.isArray(resp.jobs) ? resp.jobs : [];
           if (!jobs.length) {
             setStatus('All tabs synced.');
@@ -1338,7 +1339,22 @@ function getChatSidebarHtml_() {
 
         if (el('autoSync').checked) {
           setStatus('Auto-syncing tab...');
-          google.script.run.withSuccessHandler(() => doSend())
+          google.script.run.withSuccessHandler((resp) => {
+            const jobId = resp && resp.jobId ? String(resp.jobId) : '';
+            if (!jobId) {
+              doSend();
+              return;
+            }
+
+            pollJobUntilDone_(jobId, 'Auto-sync', (err) => {
+              if (err) {
+                setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
+                disableAll(false);
+                return;
+              }
+              doSend();
+            });
+          })
             .withFailureHandler((err) => {
               setStatus('Auto-sync failed: ' + (err && err.message ? err.message : err));
               disableAll(false);
@@ -2295,6 +2311,16 @@ function appendChatTurnToDoc(userText, assistantText) {
     return p;
   };
 
+  const insertMarkdownBlock_ = (markdown) => {
+    const md = String(markdown || '');
+    if (!md.trim()) {
+      insertPlainParagraph_('');
+      return;
+    }
+    const insertedCount = insertMarkdownIntoContainer_(body, insertAt, md);
+    insertAt += insertedCount;
+  };
+
   // Timestamp once for the whole turn, on its own line.
   insertPlainParagraph_('[' + ts + ']');
 
@@ -2309,7 +2335,7 @@ function appendChatTurnToDoc(userText, assistantText) {
 
   insertLabelParagraph_('ASSISTANT:');
   insertPlainParagraph_('');
-  insertPlainParagraph_(String(assistantText || ''));
+  insertMarkdownBlock_(String(assistantText || ''));
 
   // Spacer line
   insertPlainParagraph_('');
