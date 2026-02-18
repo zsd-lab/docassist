@@ -29,7 +29,7 @@ export function createApp({
     maxTurnsPerDoc: config?.maxTurnsPerDoc ?? 25,
     maxDocChars: config?.maxDocChars ?? 50000,
     maxDocIdChars: config?.maxDocIdChars ?? 256,
-    maxUserMessageChars: config?.maxUserMessageChars ?? 20000,
+    maxUserMessageChars: config?.maxUserMessageChars ?? 2000000,
     maxInstructionsChars: config?.maxInstructionsChars ?? 20000,
     maxUserIdChars: config?.maxUserIdChars ?? 256,
     maxChatTitleChars: config?.maxChatTitleChars ?? 120,
