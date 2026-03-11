@@ -56,7 +56,7 @@ export function createApp({
       return Number.isFinite(n) && n > 0 ? n : 120;
     })(),
     // Default model for all clients unless overridden via OPENAI_MODEL or explicit config.
-    openaiModel: config?.openaiModel || process.env.OPENAI_MODEL || "gpt-5.2-2025-12-11",
+    openaiModel: config?.openaiModel || process.env.OPENAI_MODEL || "gpt-5.4-2026-03-05",
     maxOutputTokens: (() => {
       const DEFAULT_MAX_OUTPUT_TOKENS = 1200;
       const raw = config?.maxOutputTokens ?? process.env.DOCASSIST_MAX_OUTPUT_TOKENS;

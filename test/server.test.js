@@ -734,10 +734,30 @@ test("POST /v2/sync-tab uploads and records a tab entry", async () => {
   });
 
   assert.equal(res.status, 200);
-  assert.equal(res.body.reused, false);
-  assert.equal(res.body.vectorStoreFileId, "vsf_doc");
-  assert.equal(res.body.docsFileId, 99);
-  assert.equal(res.body.fileVectorStoreId, "vs_file_1");
+
+  const jobId = res.body && res.body.jobId ? String(res.body.jobId) : "";
+  assert.ok(jobId);
+
+  // Poll job result (sync-tab runs async server-side).
+  let job = null;
+  for (let i = 0; i < 50; i += 1) {
+    const jr = await request(app).get(`/v2/jobs/${jobId}`);
+    assert.equal(jr.status, 200);
+    if (jr.body.status === "succeeded") {
+      job = jr.body;
+      break;
+    }
+    if (jr.body.status === "failed") {
+      assert.fail(String(jr.body.error || "Job failed"));
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
+  assert.ok(job && job.result);
+  assert.equal(job.result.reused, false);
+  assert.equal(job.result.vectorStoreFileId, "vsf_doc");
+  assert.equal(job.result.docsFileId, 99);
+  assert.equal(job.result.fileVectorStoreId, "vs_file_1");
 
   assert.ok(openaiCalls.find((c) => c.op === "vs.create"));
   assert.equal(openaiCalls.filter((c) => c.op === "vs.files.uploadAndPoll").length, 2);

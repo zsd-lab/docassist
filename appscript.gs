@@ -1,6 +1,6 @@
 /**
  * ---------------------------------------------------------------------------
- * GOOGLE DOCS + GPT-5.2
+ * GOOGLE DOCS + GPT-5.4
  * - Process Selected Text (one-shot, via /docs-agent)
  * - Chat Sidebar (ChatGPT-like, via /v2/*)
  * - Chat with Document (legacy threaded, history on backend, via /chat-docs)
