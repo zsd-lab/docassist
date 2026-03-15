@@ -767,6 +767,247 @@ test("POST /v2/sync-tab uploads and records a tab entry", async () => {
   assert.ok(inserts.find((i) => i.params[1] === "tab"));
 });
 
+test("POST /v2/sync-tab upgrades stale tab entries to selectable file-scope items", async () => {
+  const openaiCalls = [];
+  let upgradedTab = {
+    id: 99,
+    kind: "tab",
+    filename: "tab_Overview_tab_123_doc1.txt",
+    sha256: "tabhash",
+    created_at: "2025-01-01T00:00:00.000Z",
+    vector_store_file_id: "vsf_doc_existing",
+    file_vector_store_id: null,
+    vector_store_file_file_id: "file_doc_existing",
+    file_vector_store_file_id: null,
+    file_vector_store_file_file_id: null,
+  };
+
+  const pool = makePoolMock({
+    sessionRow: {
+      doc_id: "doc1",
+      conversation_id: "c1",
+      vector_store_id: "vs_doc",
+      instructions: "",
+      model: "test-model",
+    },
+    queryHandler: async (sql, params) => {
+      const q = String(sql);
+
+      if (q.includes("FROM docs_files") && q.includes("WHERE doc_id = $1 AND kind = $2 AND sha256 = $3")) {
+        const kind = params[1];
+        if (kind === "tab") return { rows: [upgradedTab], rowCount: 1 };
+        if (kind === "tab_chunk") {
+          return {
+            rows: [
+              {
+                id: 101,
+                vector_store_file_id: "vsf_chunk_existing",
+                vector_store_file_file_id: "file_chunk_existing",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+      }
+
+      if (q.includes("INSERT INTO docs_files")) {
+        upgradedTab = {
+          ...upgradedTab,
+          filename: params[2],
+          sha256: params[3],
+          vector_store_file_id: params[4],
+          file_vector_store_id: params[5],
+          file_vector_store_file_id: params[6],
+          vector_store_file_file_id: params[7],
+          file_vector_store_file_file_id: params[8],
+        };
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (q.includes("SELECT") && q.includes("FROM docs_files") && q.includes("kind NOT IN ('doc_chunk', 'tab_chunk', 'upload_chunk')")) {
+        return {
+          rows: [
+            {
+              id: upgradedTab.id,
+              kind: upgradedTab.kind,
+              filename: upgradedTab.filename,
+              sha256: upgradedTab.sha256,
+              created_at: upgradedTab.created_at,
+              file_vector_store_id: upgradedTab.file_vector_store_id,
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+
+      return null;
+    },
+  });
+
+  const openaiClient = {
+    vectorStores: {
+      create: async () => {
+        openaiCalls.push({ op: "vs.create", id: "vs_file_1" });
+        return { id: "vs_file_1" };
+      },
+      files: {
+        uploadAndPoll: async (vectorStoreId) => {
+          openaiCalls.push({ op: "vs.files.uploadAndPoll", vectorStoreId });
+          return { id: "vsf_file_scope_1", file_id: "file_scope_1" };
+        },
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool,
+    openaiClient,
+    config: { bodyLimit: "50kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app).post("/v2/sync-tab").send({
+    docId: "doc1",
+    tabId: "tab_123",
+    tabTitle: "Overview",
+    tabText: "Hello tab",
+    replaceKnowledge: false,
+    fileScope: true,
+  });
+
+  assert.equal(res.status, 200);
+  assert.ok(res.body.jobId);
+
+  let job = null;
+  for (let i = 0; i < 50; i += 1) {
+    const jr = await request(app).get(`/v2/jobs/${res.body.jobId}`);
+    assert.equal(jr.status, 200);
+    if (jr.body.status === "succeeded") {
+      job = jr.body;
+      break;
+    }
+    if (jr.body.status === "failed") {
+      assert.fail(String(jr.body.error || "Job failed"));
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
+  assert.ok(job && job.result);
+  assert.equal(job.result.reused, false);
+  assert.equal(job.result.vectorStoreFileId, "vsf_doc_existing");
+  assert.equal(job.result.fileVectorStoreId, "vs_file_1");
+  assert.equal(openaiCalls.filter((c) => c.op === "vs.create").length, 1);
+  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.uploadAndPoll").length, 1);
+
+  const filesRes = await request(app).get("/v2/list-files").query({ docId: "doc1" });
+  assert.equal(filesRes.status, 200);
+  assert.equal(filesRes.body.files[0].hasFileScope, true);
+});
+
+test("POST /v2/sync-tab refreshes picker label when a tab is renamed", async () => {
+  let storedTab = {
+    id: 77,
+    kind: "tab",
+    filename: "tab_Old_Title_tab_123_doc1.txt",
+    sha256: "tabhash",
+    created_at: "2025-01-01T00:00:00.000Z",
+    vector_store_file_id: "vsf_doc_existing",
+    file_vector_store_id: "vs_file_existing",
+    file_vector_store_file_id: "vsf_file_existing",
+    vector_store_file_file_id: "file_doc_existing",
+    file_vector_store_file_file_id: "file_scope_existing",
+  };
+
+  const pool = makePoolMock({
+    sessionRow: {
+      doc_id: "doc1",
+      conversation_id: "c1",
+      vector_store_id: "vs_doc",
+      instructions: "",
+      model: "test-model",
+    },
+    queryHandler: async (sql, params) => {
+      const q = String(sql);
+
+      if (q.includes("WHERE doc_id = $1 AND kind = $2 AND sha256 = $3")) {
+        return { rows: [storedTab], rowCount: 1 };
+      }
+
+      if (q.includes("INSERT INTO docs_files")) {
+        storedTab = {
+          ...storedTab,
+          filename: params[2],
+          sha256: params[3],
+          vector_store_file_id: params[4],
+          file_vector_store_id: params[5],
+          file_vector_store_file_id: params[6],
+          vector_store_file_file_id: params[7],
+          file_vector_store_file_file_id: params[8],
+        };
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (q.includes("kind NOT IN ('doc_chunk', 'tab_chunk', 'upload_chunk')")) {
+        return {
+          rows: [
+            {
+              id: storedTab.id,
+              kind: storedTab.kind,
+              filename: storedTab.filename,
+              sha256: storedTab.sha256,
+              created_at: storedTab.created_at,
+              file_vector_store_id: storedTab.file_vector_store_id,
+            },
+          ],
+          rowCount: 1,
+        };
+      }
+
+      return null;
+    },
+  });
+
+  const { app } = createApp({
+    pool,
+    openaiClient: { vectorStores: { create: async () => { throw new Error("Should not upload"); } } },
+    config: { bodyLimit: "50kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app).post("/v2/sync-tab").send({
+    docId: "doc1",
+    tabId: "tab_123",
+    tabTitle: "New Title",
+    tabText: "Hello tab",
+    replaceKnowledge: false,
+    fileScope: true,
+  });
+
+  assert.equal(res.status, 200);
+  assert.ok(res.body.jobId);
+
+  let job = null;
+  for (let i = 0; i < 50; i += 1) {
+    const jr = await request(app).get(`/v2/jobs/${res.body.jobId}`);
+    assert.equal(jr.status, 200);
+    if (jr.body.status === "succeeded") {
+      job = jr.body;
+      break;
+    }
+    if (jr.body.status === "failed") {
+      assert.fail(String(jr.body.error || "Job failed"));
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
+  assert.ok(job && job.result);
+  assert.equal(job.result.reused, true);
+  assert.equal(storedTab.filename, "tab_New_Title_tab_123_doc1.txt");
+
+  const filesRes = await request(app).get("/v2/list-files").query({ docId: "doc1" });
+  assert.equal(filesRes.status, 200);
+  assert.equal(filesRes.body.files[0].filename, "tab_New_Title_tab_123_doc1.txt");
+  assert.equal(filesRes.body.files[0].hasFileScope, true);
+});
+
 test("POST /v2/upload-file replaceKnowledge=true deletes old files before upload", async () => {
   const openaiCalls = [];
   let createdVs = 0;

@@ -948,7 +948,14 @@ c.) Coalition building through service
           file_vector_store_file_file_id
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (doc_id, kind, sha256) DO NOTHING
+        ON CONFLICT (doc_id, kind, sha256)
+        DO UPDATE SET
+          filename = EXCLUDED.filename,
+          vector_store_file_id = COALESCE(docs_files.vector_store_file_id, EXCLUDED.vector_store_file_id),
+          file_vector_store_id = EXCLUDED.file_vector_store_id,
+          file_vector_store_file_id = EXCLUDED.file_vector_store_file_id,
+          vector_store_file_file_id = COALESCE(docs_files.vector_store_file_file_id, EXCLUDED.vector_store_file_file_id),
+          file_vector_store_file_file_id = EXCLUDED.file_vector_store_file_file_id
       `,
       [
         docId,
@@ -983,6 +990,7 @@ c.) Coalition building through service
       `
         SELECT
           id,
+          filename,
           vector_store_file_id,
           file_vector_store_id,
           file_vector_store_file_id,
@@ -2218,9 +2226,11 @@ c.) Coalition building through service
       }
 
       const docHash = sha256Hex(Buffer.from(formatted, "utf8"));
+      const existingDoc = !replaceKnowledge
+        ? await findExistingDocsFileByHash_(String(docId), "doc", docHash)
+        : null;
       if (!replaceKnowledge) {
-        const existingDoc = await findExistingDocsFileByHash_(String(docId), "doc", docHash);
-        if (existingDoc?.vector_store_file_id) {
+        if (existingDoc?.vector_store_file_id && (!fileScopeEnabled || existingDoc.file_vector_store_id)) {
           return res.json({
             vectorStoreFileId: existingDoc.vector_store_file_id,
             docsFileId: existingDoc.id,
@@ -2321,12 +2331,19 @@ c.) Coalition building through service
         throw new Error("No content to sync.");
       }
 
-      await recordVectorStoreFile(String(docId), "doc", docEntryFilename, docHash, firstDocVsfId, {
+      await recordVectorStoreFile(
+        String(docId),
+        "doc",
+        docEntryFilename,
+        docHash,
+        existingDoc?.vector_store_file_id || firstDocVsfId,
+        {
         fileVectorStoreId: fileVectorStoreId,
         fileVectorStoreFileId: firstFileScopeVsfId,
-        vectorStoreFileFileId: firstDocVsfFileId,
+        vectorStoreFileFileId: existingDoc?.vector_store_file_file_id || firstDocVsfFileId,
         fileVectorStoreFileFileId: firstFileScopeVsfFileId,
-      });
+        }
+      );
 
       try {
         await updateDocSummary_({
@@ -2343,7 +2360,7 @@ c.) Coalition building through service
       // Best-effort: fetch docs_files id for UI convenience.
       const created = await findExistingDocsFileByHash_(String(docId), "doc", docHash);
       return res.json({
-        vectorStoreFileId: firstDocVsfId,
+        vectorStoreFileId: existingDoc?.vector_store_file_id || firstDocVsfId,
         docsFileId: created?.id,
         fileVectorStoreId,
         reused: false,
@@ -2448,9 +2465,27 @@ c.) Coalition building through service
           // Hash includes tabId to avoid cross-tab dedupe collisions.
           const tabHash = sha256Hex(Buffer.from(`${String(tabId)}\n\n${formatted}`, "utf8"));
 
+          const existingTab = !replaceKnowledge
+            ? await findExistingDocsFileByHash_(String(docId), "tab", tabHash)
+            : null;
+
           if (!replaceKnowledge) {
-            const existingTab = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
-            if (existingTab?.vector_store_file_id) {
+            if (existingTab?.vector_store_file_id && (!fileScopeEnabled || existingTab.file_vector_store_id)) {
+              if (String(existingTab.filename || "") !== String(tabEntryFilename || "")) {
+                await recordVectorStoreFile(
+                  String(docId),
+                  "tab",
+                  tabEntryFilename,
+                  tabHash,
+                  existingTab.vector_store_file_id,
+                  {
+                    fileVectorStoreId: existingTab.file_vector_store_id || null,
+                    fileVectorStoreFileId: existingTab.file_vector_store_file_id || null,
+                    vectorStoreFileFileId: existingTab.vector_store_file_file_id || null,
+                    fileVectorStoreFileFileId: existingTab.file_vector_store_file_file_id || null,
+                  }
+                );
+              }
               return {
                 vectorStoreFileId: existingTab.vector_store_file_id,
                 docsFileId: existingTab.id,
@@ -2550,12 +2585,19 @@ c.) Coalition building through service
             throw new Error("No content to sync.");
           }
 
-          await recordVectorStoreFile(String(docId), "tab", tabEntryFilename, tabHash, firstDocVsfId, {
+          await recordVectorStoreFile(
+            String(docId),
+            "tab",
+            tabEntryFilename,
+            tabHash,
+            existingTab?.vector_store_file_id || firstDocVsfId,
+            {
             fileVectorStoreId: fileVectorStoreId,
             fileVectorStoreFileId: firstFileScopeVsfId,
-            vectorStoreFileFileId: firstDocVsfFileId,
+            vectorStoreFileFileId: existingTab?.vector_store_file_file_id || firstDocVsfFileId,
             fileVectorStoreFileFileId: firstFileScopeVsfFileId,
-          });
+            }
+          );
 
           try {
             await updateDocSummary_({
@@ -2572,7 +2614,7 @@ c.) Coalition building through service
           // Best-effort: fetch docs_files id for UI convenience.
           const created = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
           return {
-            vectorStoreFileId: firstDocVsfId,
+            vectorStoreFileId: existingTab?.vector_store_file_id || firstDocVsfId,
             docsFileId: created?.id,
             fileVectorStoreId,
             reused: false,
@@ -2701,7 +2743,7 @@ c.) Coalition building through service
       const safeName = String(filename).replace(/[^a-zA-Z0-9._-]+/g, "_");
 
       const existing = await findExistingDocsFileByHash_(String(docId), "upload", hash);
-      if (existing?.vector_store_file_id) {
+      if (existing?.vector_store_file_id && existing.file_vector_store_id) {
         return res.json({
           vectorStoreFileId: existing.vector_store_file_id,
           docsFileId: existing.id,
@@ -2717,10 +2759,18 @@ c.) Coalition building through service
       });
       const fileVectorStoreId = fileVectorStore?.id;
 
-      const uploadableDoc = await toFile(buf, safeName, {
-        type: String(mimeType || "application/octet-stream"),
-      });
-      const vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableDoc);
+      let vsFile = null;
+      if (existing?.vector_store_file_id) {
+        vsFile = {
+          id: existing.vector_store_file_id,
+          file_id: existing.vector_store_file_file_id || null,
+        };
+      } else {
+        const uploadableDoc = await toFile(buf, safeName, {
+          type: String(mimeType || "application/octet-stream"),
+        });
+        vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableDoc);
+      }
 
       const uploadableFileScope = await toFile(buf, safeName, {
         type: String(mimeType || "application/octet-stream"),
