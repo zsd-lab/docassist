@@ -1,9 +1,7 @@
 /**
  * ---------------------------------------------------------------------------
  * GOOGLE DOCS + GPT-5.4
- * - Process Selected Text (one-shot, via /docs-agent)
  * - Chat Sidebar (ChatGPT-like, via /v2/*)
- * - Chat with Document (legacy threaded, history on backend, via /chat-docs)
  * ---------------------------------------------------------------------------
  */
 
@@ -17,9 +15,6 @@ function onOpen() {
       .addItem('Reset Server State (this document)', 'resetServerStateForThisDocumentMenu')
       .addSeparator()
       .addItem('Sync Document to Knowledge', 'syncDocumentToKnowledge')
-      .addSeparator()
-      .addItem('Process Selected Text (legacy)', 'processSelection')
-      .addItem('Chat with Document (legacy)', 'chatWithDocument')
       .addToUi();
   } catch (e) {
     // Running from Apps Script editor or other non-UI contexts will throw.
@@ -300,7 +295,7 @@ function getChatSidebarHtml_() {
       <select id="fileScope">
         <option value="">All files</option>
       </select>
-      <div class="small">Pick a file to scope chat to it. Upload/sync creates selectable items.</div>
+      <div class="small">Pick a file to scope chat to it. If the file has no dedicated scope yet, the backend creates it on first use.</div>
     </div>
 
     <div class="row">
@@ -1011,17 +1006,52 @@ function getChatSidebarHtml_() {
 
         google.script.run
           .withSuccessHandler((resp) => {
-            const files = (resp && resp.files) ? resp.files : [];
+            const files = Array.isArray(resp && resp.files) ? resp.files.slice() : [];
+            const scopeRank = (f) => {
+              const status = String(
+                (f && (f.fileScopeStatus || (f.hasFileScope ? 'ready' : 'lazy'))) || 'lazy'
+              ).toLowerCase();
+              return status === 'ready' ? 0 : 1;
+            };
+
+            files.sort((a, b) => scopeRank(a) - scopeRank(b));
+
+            let insertedReadyHeader = false;
+            let insertedLazyHeader = false;
+
             for (const f of files) {
               if (!f || f.id == null) continue;
+              const scopeStatus = String(
+                f.fileScopeStatus || (f.hasFileScope ? 'ready' : 'lazy')
+              ).toLowerCase();
+
+              if (scopeStatus === 'ready' && !insertedReadyHeader) {
+                const header = document.createElement('option');
+                header.value = '__header_ready__';
+                header.textContent = '──────── Ready scopes ────────';
+                header.disabled = true;
+                sel.appendChild(header);
+                insertedReadyHeader = true;
+              }
+
+              if (scopeStatus === 'lazy' && !insertedLazyHeader) {
+                const header = document.createElement('option');
+                header.value = '__header_lazy__';
+                header.textContent = '──────── On-demand scopes ─────';
+                header.disabled = true;
+                sel.appendChild(header);
+                insertedLazyHeader = true;
+              }
+
               const opt = document.createElement('option');
               opt.value = String(f.id);
               const name = String(f.filename || '(unnamed)');
               const kind = String(f.kind || '');
               opt.textContent = (kind ? ('[' + kind + '] ') : '') + name;
-              if (f.hasFileScope === false) {
-                opt.textContent += ' (not selectable yet)';
-                opt.disabled = true;
+              if (scopeStatus === 'lazy') {
+                opt.textContent += ' (scope created on first use)';
+              } else if (scopeStatus === 'ready') {
+                opt.textContent += ' (ready)';
               }
               sel.appendChild(opt);
             }
@@ -2629,225 +2659,4 @@ function parseInlineMarkdownRuns_(line) {
 
   endRun_();
   return { text: out, runs: runs };
-}
-
-/**
- * ========== ONE-SHOT MODE: PROCESS SELECTED TEXT ==========
- */
-function processSelection() {
-  const doc = DocumentApp.getActiveDocument();
-  const selection = doc.getSelection();
-  const ui = DocumentApp.getUi();
-
-  // 1. Check for selection
-  if (!selection) {
-    ui.alert('Please select some text first.');
-    return;
-  }
-
-  // 2. Extract text from selection
-  const elements = selection.getRangeElements();
-  let selectedText = "";
-  
-  for (let i = 0; i < elements.length; i++) {
-    const rangeElement = elements[i];
-    const element = rangeElement.getElement();
-    
-    if (element.editAsText) {
-      const text = element.editAsText().getText();
-      if (rangeElement.isPartial()) {
-        const startOffset = rangeElement.getStartOffset();
-        const endOffset = rangeElement.getEndOffsetInclusive();
-        selectedText += text.substring(startOffset, endOffset + 1);
-      } else {
-        selectedText += text;
-      }
-      selectedText += "\n";
-    }
-  }
-
-  if (!selectedText.trim()) {
-    ui.alert('Selection contains no text.');
-    return;
-  }
-
-  // 3. Get instructions from user
-  const response = ui.prompt(
-    'Assistant Instructions',
-    'Enter instruction (e.g. "Summarize", "Translate to Hungarian", "Improve style"):',
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (response.getSelectedButton() !== ui.Button.OK) {
-    return;
-  }
-
-  const userInstruction = response.getResponseText();
-
-  // 4. Call backend (one-shot)
-  try {
-    const generatedText = callOpenAI(selectedText, userInstruction);
-    
-    // 5. Output result in document
-    const body = doc.getBody();
-    
-    // Separator
-    body.appendHorizontalRule();
-    
-    // Label paragraph
-    const labelPara = body.appendParagraph("Assistant Response:");
-    
-    // Use bold instead of heading (safer styling)
-    try {
-      labelPara.setBold(true);
-    } catch (styleError) {
-      console.log("Could not bold label: " + styleError);
-    }
-    
-    // Append AI response
-    body.appendParagraph(generatedText);
-    
-  } catch (e) {
-    ui.alert('Error: ' + e.toString());
-  }
-}
-
-/**
- * ========== CHAT WITH DOCUMENT MODE ==========
- * History: backend szerveren, docId alapján.
- */
-function chatWithDocument() {
-  const doc = DocumentApp.getActiveDocument();
-  const ui = DocumentApp.getUi();
-
-  // 1. Full document text as context
-  const docText = doc.getBody().getText();
-
-  if (!docText.trim()) {
-    ui.alert('This document is empty.');
-    return;
-  }
-
-  // 2. Ask user for their message / question
-  const response = ui.prompt(
-    'Chat with this document',
-    'What would you like to ask or do?',
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (response.getSelectedButton() !== ui.Button.OK) {
-    return;
-  }
-
-  const userMessage = response.getResponseText().trim();
-  if (!userMessage) {
-    ui.alert('Please enter a question or instruction.');
-    return;
-  }
-
-  // 3. Call backend: docId + docText + userMessage
-  try {
-    const reply = callChatBackend(doc.getId(), docText, userMessage);
-
-    // 4. Show result in document
-    const body = doc.getBody();
-    body.appendHorizontalRule();
-    const labelPara = body.appendParagraph("ChatGPT answer:");
-    try {
-      labelPara.setBold(true);
-    } catch (e) {}
-    body.appendParagraph(reply);
-
-  } catch (e) {
-    ui.alert('Error: ' + e.toString());
-  }
-}
-
-/**
- * ========== BACKEND CALLS ==========
- * 1) callOpenAI: /docs-agent (one-shot)
- * 2) callChatBackend: /chat-docs (threaded, backend history)
- */
-
-function callOpenAI(textToProcess, instruction) {
-  const BACKEND_URL = PropertiesService.getScriptProperties().getProperty('DOCS_AGENT_URL');
-  if (!BACKEND_URL) {
-    throw new Error("Backend URL missing. Set 'DOCS_AGENT_URL' in Project Settings → Script Properties (key: DOCS_AGENT_URL).");
-  }
-
-  const payload = {
-    text: textToProcess,
-    instruction: instruction
-  };
-
-  const options = {
-    method: "post",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch(BACKEND_URL, options);
-  const responseCode = response.getResponseCode();
-  const responseText = response.getContentText();
-
-  let json;
-  try {
-    json = JSON.parse(responseText);
-  } catch (err) {
-    throw new Error("Backend returned invalid JSON: " + responseText);
-  }
-
-  if (responseCode !== 200) {
-    const errorMsg = json && json.error ? json.error : responseText;
-    throw new Error("Backend Error (" + responseCode + "): " + errorMsg);
-  }
-
-  if (!json.resultText) {
-    throw new Error("Backend returned no 'resultText'. Raw response: " + responseText);
-  }
-
-  return String(json.resultText).trim();
-}
-
-function callChatBackend(docId, docText, userMessage) {
-  const BACKEND_URL = PropertiesService.getScriptProperties().getProperty('DOCS_AGENT_CHAT_URL');
-  if (!BACKEND_URL) {
-    throw new Error("Chat backend URL missing. Set 'DOCS_AGENT_CHAT_URL' in Project Settings → Script Properties (key: DOCS_AGENT_CHAT_URL).");
-  }
-
-  const payload = {
-    docId: docId,
-    docText: docText,
-    userMessage: userMessage
-  };
-
-  const options = {
-    method: "post",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const response = UrlFetchApp.fetch(BACKEND_URL, options);
-  const responseCode = response.getResponseCode();
-  const responseText = response.getContentText();
-
-  let json;
-  try {
-    json = JSON.parse(responseText);
-  } catch (err) {
-    throw new Error("Chat backend returned invalid JSON: " + responseText);
-  }
-
-  if (responseCode !== 200) {
-    const errorMsg = json && json.error ? json.error : responseText;
-    throw new Error("Chat backend Error (" + responseCode + "): " + errorMsg);
-  }
-
-  if (!json.reply) {
-    throw new Error("Chat backend returned no 'reply'. Raw response: " + responseText);
-  }
-
-  return String(json.reply).trim();
 }

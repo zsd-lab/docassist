@@ -1,11 +1,3 @@
-POST http://localhost:3000/docs-agent
-Content-Type: application/json
-
-{
-  "text": "Ez egy nagyon hosszú szöveg, amit szeretnék összefoglalni.",
-  "instruction": "Foglaljad össze magyarul."
-}
-
 ###
 # V2 (ChatGPT-like) examples
 # If you set DOCASSIST_TOKEN on the server, add:

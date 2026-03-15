@@ -13,18 +13,6 @@ function makePoolMock({ sessionRow, queryHandler } = {}) {
 
       const q = String(sql);
 
-      if (q.includes("INSERT INTO chat_history")) {
-        return { rows: [], rowCount: 1 };
-      }
-
-      if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
-        return { rows: [{ cnt: "0" }], rowCount: 1 };
-      }
-
-      if (q.includes("DELETE FROM chat_history") && q.includes("WHERE id IN")) {
-        return { rows: [], rowCount: 0 };
-      }
-
       if (q.includes("SELECT doc_id, conversation_id")) {
         return { rows: sessionRow ? [sessionRow] : [] };
       }
@@ -92,7 +80,6 @@ test("POST /v2/chat missing fields -> 400", async () => {
 });
 
 test("POST /v2/chat asked model -> local response without OpenAI call", async () => {
-  const inserts = [];
   const { app } = createApp({
     pool: makePoolMock({
       sessionRow: {
@@ -101,17 +88,6 @@ test("POST /v2/chat asked model -> local response without OpenAI call", async ()
         vector_store_id: "vs1",
         instructions: "",
         model: "test-model",
-      },
-      queryHandler: async (sql, params) => {
-        const q = String(sql);
-        if (q.includes("INSERT INTO chat_history")) {
-          inserts.push(params);
-          return { rows: [], rowCount: 1 };
-        }
-        if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
-          return { rows: [{ cnt: "0" }], rowCount: 1 };
-        }
-        return null;
       },
     }),
     openaiClient: {},
@@ -125,17 +101,9 @@ test("POST /v2/chat asked model -> local response without OpenAI call", async ()
   assert.equal(res.status, 200);
   assert.equal(res.body.responseId, "local-model-info");
   assert.match(res.body.reply, /test-model/);
-
-  assert.equal(inserts.length, 2);
-  assert.deepEqual(inserts[0], ["doc1", "user", "which model are you using?"]);
-  assert.equal(inserts[1][0], "doc1");
-  assert.equal(inserts[1][1], "assistant");
-  assert.match(String(inserts[1][2]), /test-model/);
 });
 
-test("POST /v2/chat persists user+assistant turns (OpenAI path)", async () => {
-  const calls = [];
-
+test("POST /v2/chat replies without persisting duplicate local doc turns", async () => {
   const openaiClient = {
     responses: {
       async create() {
@@ -153,17 +121,6 @@ test("POST /v2/chat persists user+assistant turns (OpenAI path)", async () => {
         instructions: "",
         model: "test-model",
       },
-      queryHandler: async (sql, params) => {
-        const q = String(sql);
-        if (q.includes("INSERT INTO chat_history")) {
-          calls.push({ type: "insert", params });
-          return { rows: [], rowCount: 1 };
-        }
-        if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
-          return { rows: [{ cnt: "0" }], rowCount: 1 };
-        }
-        return null;
-      },
     }),
     openaiClient,
     config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
@@ -176,11 +133,6 @@ test("POST /v2/chat persists user+assistant turns (OpenAI path)", async () => {
   assert.equal(res.status, 200);
   assert.equal(res.body.responseId, "r1");
   assert.equal(res.body.reply, "Hello from OpenAI");
-
-  const inserts = calls.filter((c) => c.type === "insert").map((c) => c.params);
-  assert.equal(inserts.length, 2);
-  assert.deepEqual(inserts[0], ["doc1", "user", "hi"]);
-  assert.deepEqual(inserts[1], ["doc1", "assistant", "Hello from OpenAI"]);
 });
 
 test("Oversized body returns JSON 413", async () => {
@@ -191,7 +143,7 @@ test("Oversized body returns JSON 413", async () => {
   });
 
   const big = "a".repeat(5000);
-  const res = await request(app).post("/docs-agent").send({ text: big, instruction: "x" });
+  const res = await request(app).post("/v2/chat").send({ docId: "doc1", userMessage: big });
   assert.equal(res.status, 413);
   assert.ok(res.body && typeof res.body.error === "string");
 });
@@ -337,8 +289,10 @@ test("GET /v2/list-files returns files", async () => {
     sha256: "h1",
     createdAt: "2025-01-01T00:00:00.000Z",
     hasFileScope: true,
+    fileScopeStatus: "ready",
   });
   assert.equal(res.body.files[1].hasFileScope, false);
+  assert.equal(res.body.files[1].fileScopeStatus, "lazy");
 });
 
 test("POST /v2/chat with fileId uses file-scoped vector store", async () => {
@@ -363,15 +317,27 @@ test("POST /v2/chat with fileId uses file-scoped vector store", async () => {
       },
       queryHandler: async (sql, params) => {
         const q = String(sql);
-        if (q.includes("SELECT file_vector_store_id") && q.includes("FROM docs_files")) {
+        if (q.includes("FROM docs_files") && q.includes("WHERE doc_id = $1 AND id = $2")) {
           assert.deepEqual(params, ["doc1", 12]);
-          return { rows: [{ file_vector_store_id: "vs_file" }], rowCount: 1 };
-        }
-        if (q.includes("INSERT INTO chat_history")) {
-          return { rows: [], rowCount: 1 };
-        }
-        if (q.includes("SELECT COUNT(*) AS cnt") && q.includes("FROM chat_history")) {
-          return { rows: [{ cnt: "0" }], rowCount: 1 };
+          return {
+            rows: [
+              {
+                id: 12,
+                doc_id: "doc1",
+                kind: "upload",
+                filename: "a.txt",
+                sha256: "h1",
+                vector_store_file_id: "vsf_doc",
+                file_vector_store_id: "vs_file",
+                file_vector_store_file_id: "vsf_file",
+                vector_store_file_file_id: "file_doc",
+                file_vector_store_file_file_id: "file_doc",
+                source_parent_kind: null,
+                source_parent_sha256: null,
+              },
+            ],
+            rowCount: 1,
+          };
         }
         return null;
       },
@@ -390,6 +356,107 @@ test("POST /v2/chat with fileId uses file-scoped vector store", async () => {
 
   assert.equal(openaiCalls.length, 1);
   assert.deepEqual(openaiCalls[0].tools[0].vector_store_ids, ["vs_file"]);
+});
+
+test("POST /v2/chat with fileId lazily materializes file-scoped vector store", async () => {
+  const openaiCalls = [];
+  const updates = [];
+  let attachCount = 0;
+
+  const openaiClient = {
+    vectorStores: {
+      create: async (payload) => {
+        openaiCalls.push({ op: "vs.create", payload });
+        return { id: "vs_file_lazy" };
+      },
+      files: {
+        createAndPoll: async (vectorStoreId, body) => {
+          attachCount += 1;
+          openaiCalls.push({ op: "vs.files.createAndPoll", vectorStoreId, body });
+          return { id: `vsf_attach_${attachCount}`, file_id: body.file_id };
+        },
+      },
+    },
+    responses: {
+      async create(payload) {
+        openaiCalls.push({ op: "responses.create", payload });
+        return { id: "r_lazy", output_text: "Lazy scoped" };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      sessionRow: {
+        doc_id: "doc1",
+        conversation_id: "c1",
+        vector_store_id: "vs_doc",
+        instructions: "",
+        model: "test-model",
+      },
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+
+        if (q.includes("FROM docs_files") && q.includes("WHERE doc_id = $1 AND id = $2")) {
+          assert.deepEqual(params, ["doc1", 12]);
+          return {
+            rows: [
+              {
+                id: 12,
+                doc_id: "doc1",
+                kind: "tab",
+                filename: "tab_Overview.txt",
+                sha256: "tabhash",
+                vector_store_file_id: "vsf_doc_root",
+                file_vector_store_id: null,
+                file_vector_store_file_id: null,
+                vector_store_file_file_id: "file_chunk_1",
+                file_vector_store_file_file_id: null,
+                source_parent_kind: null,
+                source_parent_sha256: null,
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+
+        if (q.includes("AND source_parent_kind = $3") && q.includes("AND source_parent_sha256 = $4")) {
+          assert.deepEqual(params, ["doc1", "tab_chunk", "tab", "tabhash"]);
+          return {
+            rows: [
+              { id: 101, filename: "chunk1.txt", vector_store_file_file_id: "file_chunk_1" },
+              { id: 102, filename: "chunk2.txt", vector_store_file_file_id: "file_chunk_2" },
+            ],
+            rowCount: 2,
+          };
+        }
+
+        if (q.includes("UPDATE docs_files") && q.includes("file_vector_store_id = $2")) {
+          updates.push(params);
+          return { rows: [], rowCount: 1 };
+        }
+
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chat")
+    .send({ docId: "doc1", userMessage: "hi", fileId: 12 });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reply, "Lazy scoped");
+  assert.deepEqual(res.body.scope, { type: "file", fileId: 12 });
+  assert.ok(openaiCalls.find((c) => c.op === "vs.create"));
+  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.createAndPoll").length, 2);
+  assert.deepEqual(
+    openaiCalls.find((c) => c.op === "responses.create").payload.tools[0].vector_store_ids,
+    ["vs_file_lazy"]
+  );
+  assert.equal(updates.length, 3);
 });
 
 test("POST /v2/reset-doc missing docId -> 400", async () => {
@@ -411,7 +478,6 @@ test("POST /v2/reset-doc deletes DB state", async () => {
       queryHandler: async (sql, params) => {
         calls.push({ sql: String(sql), params });
         const q = String(sql);
-        if (q.includes("DELETE FROM chat_history")) return { rows: [], rowCount: 7 };
         if (q.includes("DELETE FROM docs_files")) return { rows: [], rowCount: 2 };
         if (q.includes("DELETE FROM docs_sessions")) return { rows: [], rowCount: 1 };
         return null;
@@ -426,12 +492,12 @@ test("POST /v2/reset-doc deletes DB state", async () => {
   assert.equal(res.body.ok, true);
   assert.equal(res.body.docId, "doc1");
   assert.deepEqual(res.body.deleted, {
-    chatHistory: 7,
+    chatHistory: 0,
     docsFiles: 2,
     docsSessions: 1,
   });
   assert.ok(res.headers["x-request-id"]);
-  assert.ok(calls.length >= 3);
+  assert.ok(calls.length >= 2);
 });
 
 test("POST /v2/reset-doc cleanupOpenAI=true attempts OpenAI deletes (best-effort)", async () => {
@@ -464,7 +530,6 @@ test("POST /v2/reset-doc cleanupOpenAI=true attempts OpenAI deletes (best-effort
         if (q.includes("SELECT vector_store_file_id")) {
           return { rows: [{ vector_store_file_id: "f1" }, { vector_store_file_id: "f2" }], rowCount: 2 };
         }
-        if (q.includes("DELETE FROM chat_history")) return { rows: [], rowCount: 0 };
         if (q.includes("DELETE FROM docs_files")) return { rows: [], rowCount: 2 };
         if (q.includes("DELETE FROM docs_sessions")) return { rows: [], rowCount: 1 };
         return null;
@@ -547,6 +612,7 @@ test("POST /v2/sync-doc replaceKnowledge=true deletes old files before upload", 
   const openaiCalls = [];
   let createdVs = 0;
   let uploadCalls = 0;
+  let attachCalls = 0;
   const openaiClient = {
     vectorStores: {
       create: async () => {
@@ -562,7 +628,12 @@ test("POST /v2/sync-doc replaceKnowledge=true deletes old files before upload", 
         uploadAndPoll: async (vectorStoreId) => {
           openaiCalls.push({ op: "vs.files.uploadAndPoll", vectorStoreId });
           uploadCalls += 1;
-          return { id: uploadCalls === 1 ? "new_file" : "new_file_scoped" };
+          return { id: uploadCalls === 1 ? "new_file" : "new_file_scoped", file_id: `file_${uploadCalls}` };
+        },
+        createAndPoll: async (vectorStoreId, body) => {
+          attachCalls += 1;
+          openaiCalls.push({ op: "vs.files.createAndPoll", vectorStoreId, body });
+          return { id: `attached_${attachCalls}`, file_id: body.file_id };
         },
       },
     },
@@ -628,7 +699,98 @@ test("POST /v2/sync-doc replaceKnowledge=true deletes old files before upload", 
 
   // New upload occurs
   assert.ok(openaiCalls.find((c) => c.op === "vs.files.uploadAndPoll"));
+  assert.ok(openaiCalls.find((c) => c.op === "vs.files.createAndPoll" && c.body.file_id === "file_1"));
   assert.ok(openaiCalls.find((c) => c.op === "vs.create"));
+});
+
+test("POST /v2/sync-doc bounds concurrent chunk uploads", async () => {
+  let uploadCalls = 0;
+  let activeUploads = 0;
+  let maxActiveUploads = 0;
+  let docsFileIdSeq = 1;
+  const storedDocsFiles = new Map();
+
+  const openaiClient = {
+    vectorStores: {
+      files: {
+        uploadAndPoll: async () => {
+          uploadCalls += 1;
+          activeUploads += 1;
+          maxActiveUploads = Math.max(maxActiveUploads, activeUploads);
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          activeUploads -= 1;
+          return { id: `vsf_${uploadCalls}`, file_id: `file_${uploadCalls}` };
+        },
+      },
+    },
+  };
+
+  const pool = makePoolMock({
+    sessionRow: {
+      doc_id: "doc1",
+      conversation_id: "c1",
+      vector_store_id: "vs_doc",
+      instructions: "",
+      model: "test-model",
+    },
+    queryHandler: async (sql, params) => {
+      const q = String(sql);
+
+      if (q.includes("FROM docs_files") && q.includes("WHERE doc_id = $1 AND kind = $2 AND sha256 = $3")) {
+        const key = `${params[1]}::${params[2]}`;
+        const row = storedDocsFiles.get(key);
+        return row ? { rows: [row], rowCount: 1 } : { rows: [], rowCount: 0 };
+      }
+
+      if (q.includes("INSERT INTO docs_files")) {
+        const row = {
+          id: docsFileIdSeq,
+          filename: params[2],
+          sha256: params[3],
+          vector_store_file_id: params[4],
+          file_vector_store_id: params[5],
+          file_vector_store_file_id: params[6],
+          vector_store_file_file_id: params[7],
+          file_vector_store_file_file_id: params[8],
+        };
+        docsFileIdSeq += 1;
+        storedDocsFiles.set(`${params[1]}::${params[3]}`, row);
+        return { rows: [], rowCount: 1 };
+      }
+
+      return null;
+    },
+  });
+
+  const { app } = createApp({
+    pool,
+    openaiClient,
+    config: {
+      bodyLimit: "200kb",
+      token: "",
+      openaiModel: "test-model",
+      summaryEnabled: false,
+      chunkMaxTokens: 101,
+      chunkOverlapTokens: 0,
+      chunkUploadConcurrency: 2,
+    },
+  });
+
+  const res = await request(app)
+    .post("/v2/sync-doc")
+    .send({
+      docId: "doc1",
+      docTitle: "Big Doc",
+      docText: `# Heading\n\n${"A".repeat(2600)}`,
+      replaceKnowledge: false,
+      fileScope: false,
+    });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reused, false);
+  assert.ok(uploadCalls > 2);
+  assert.ok(maxActiveUploads > 1);
+  assert.ok(maxActiveUploads <= 2);
 });
 
 test("POST /v2/sync-tab missing fields -> 400", async () => {
@@ -655,6 +817,7 @@ test("POST /v2/sync-tab uploads and records a tab entry", async () => {
   const openaiCalls = [];
   let createdVs = 0;
   let uploadCalls = 0;
+  let attachCalls = 0;
 
   const openaiClient = {
     conversations: {
@@ -671,7 +834,12 @@ test("POST /v2/sync-tab uploads and records a tab entry", async () => {
         uploadAndPoll: async (vectorStoreId) => {
           uploadCalls += 1;
           openaiCalls.push({ op: "vs.files.uploadAndPoll", vectorStoreId });
-          return { id: uploadCalls === 1 ? "vsf_doc" : "vsf_tab" };
+          return { id: uploadCalls === 1 ? "vsf_doc" : "vsf_tab", file_id: `file_${uploadCalls}` };
+        },
+        createAndPoll: async (vectorStoreId, body) => {
+          attachCalls += 1;
+          openaiCalls.push({ op: "vs.files.createAndPoll", vectorStoreId, body });
+          return { id: attachCalls === 1 ? "vsf_tab" : `vsf_tab_${attachCalls}`, file_id: body.file_id };
         },
       },
     },
@@ -760,7 +928,8 @@ test("POST /v2/sync-tab uploads and records a tab entry", async () => {
   assert.equal(job.result.fileVectorStoreId, "vs_file_1");
 
   assert.ok(openaiCalls.find((c) => c.op === "vs.create"));
-  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.uploadAndPoll").length, 2);
+  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.uploadAndPoll").length, 1);
+  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.createAndPoll").length, 1);
 
   // Ensure we inserted a tab entry (and chunk entries may exist)
   assert.ok(inserts.length >= 1);
@@ -851,9 +1020,9 @@ test("POST /v2/sync-tab upgrades stale tab entries to selectable file-scope item
         return { id: "vs_file_1" };
       },
       files: {
-        uploadAndPoll: async (vectorStoreId) => {
-          openaiCalls.push({ op: "vs.files.uploadAndPoll", vectorStoreId });
-          return { id: "vsf_file_scope_1", file_id: "file_scope_1" };
+        createAndPoll: async (vectorStoreId, body) => {
+          openaiCalls.push({ op: "vs.files.createAndPoll", vectorStoreId, body });
+          return { id: "vsf_file_scope_1", file_id: body.file_id };
         },
       },
     },
@@ -896,7 +1065,8 @@ test("POST /v2/sync-tab upgrades stale tab entries to selectable file-scope item
   assert.equal(job.result.vectorStoreFileId, "vsf_doc_existing");
   assert.equal(job.result.fileVectorStoreId, "vs_file_1");
   assert.equal(openaiCalls.filter((c) => c.op === "vs.create").length, 1);
-  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.uploadAndPoll").length, 1);
+  assert.equal(openaiCalls.filter((c) => c.op === "vs.files.createAndPoll").length, 1);
+  assert.ok(openaiCalls.find((c) => c.op === "vs.files.createAndPoll" && c.body.file_id === "file_chunk_existing"));
 
   const filesRes = await request(app).get("/v2/list-files").query({ docId: "doc1" });
   assert.equal(filesRes.status, 200);
@@ -1012,6 +1182,7 @@ test("POST /v2/upload-file replaceKnowledge=true deletes old files before upload
   const openaiCalls = [];
   let createdVs = 0;
   let uploadCalls = 0;
+  let attachCalls = 0;
   const openaiClient = {
     vectorStores: {
       create: async () => {
@@ -1027,7 +1198,12 @@ test("POST /v2/upload-file replaceKnowledge=true deletes old files before upload
         uploadAndPoll: async (vectorStoreId) => {
           openaiCalls.push({ op: "vs.files.uploadAndPoll", vectorStoreId });
           uploadCalls += 1;
-          return { id: uploadCalls === 1 ? "new_upload" : "new_upload_scoped" };
+          return { id: uploadCalls === 1 ? "new_upload" : "new_upload_scoped", file_id: `file_${uploadCalls}` };
+        },
+        createAndPoll: async (vectorStoreId, body) => {
+          attachCalls += 1;
+          openaiCalls.push({ op: "vs.files.createAndPoll", vectorStoreId, body });
+          return { id: `attached_upload_${attachCalls}`, file_id: body.file_id };
         },
       },
     },
@@ -1091,5 +1267,6 @@ test("POST /v2/upload-file replaceKnowledge=true deletes old files before upload
   assert.ok(openaiCalls.find((c) => c.op === "vs.files.del" && c.fileId === "f1"));
   assert.ok(openaiCalls.find((c) => c.op === "vs.files.del" && c.fileId === "f2"));
   assert.ok(openaiCalls.find((c) => c.op === "vs.files.uploadAndPoll"));
+  assert.ok(openaiCalls.find((c) => c.op === "vs.files.createAndPoll" && c.body.file_id === "file_1"));
   assert.ok(openaiCalls.find((c) => c.op === "vs.create"));
 });

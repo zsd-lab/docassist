@@ -26,7 +26,6 @@ export function createApp({
       const s = String(raw).trim().toLowerCase();
       return s === "1" || s === "true" || s === "yes" || s === "on";
     })(),
-    maxTurnsPerDoc: config?.maxTurnsPerDoc ?? 25,
     maxDocChars: config?.maxDocChars ?? 50000,
     maxDocIdChars: config?.maxDocIdChars ?? 256,
     maxUserMessageChars: config?.maxUserMessageChars ?? 2000000,
@@ -102,6 +101,12 @@ export function createApp({
       if (raw == null || String(raw).trim() === "") return 150;
       const n = Number.parseInt(String(raw), 10);
       return Number.isFinite(n) && n >= 0 ? n : 150;
+    })(),
+    chunkUploadConcurrency: (() => {
+      const raw = config?.chunkUploadConcurrency ?? process.env.DOCASSIST_CHUNK_UPLOAD_CONCURRENCY;
+      if (raw == null || String(raw).trim() === "") return 3;
+      const n = Number.parseInt(String(raw), 10);
+      return Number.isFinite(n) && n > 0 ? n : 3;
     })(),
     chatLogEnabled: (() => {
       const raw = config?.chatLogEnabled ?? process.env.DOCASSIST_CHAT_LOG_ENABLED;
@@ -647,6 +652,8 @@ c.) Coalition building through service
       fileVectorStoreFileId = null,
       vectorStoreFileFileId = null,
       fileVectorStoreFileFileId = null,
+      sourceParentKind = null,
+      sourceParentSha256 = null,
     } = {}
   ) {
     await pool.query(
@@ -660,9 +667,11 @@ c.) Coalition building through service
           file_vector_store_id,
           file_vector_store_file_id,
           vector_store_file_file_id,
-          file_vector_store_file_file_id
+          file_vector_store_file_file_id,
+          source_parent_kind,
+          source_parent_sha256
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (doc_id, kind, sha256)
         DO UPDATE SET
           filename = EXCLUDED.filename,
@@ -670,7 +679,9 @@ c.) Coalition building through service
           file_vector_store_id = EXCLUDED.file_vector_store_id,
           file_vector_store_file_id = EXCLUDED.file_vector_store_file_id,
           vector_store_file_file_id = COALESCE(docs_files.vector_store_file_file_id, EXCLUDED.vector_store_file_file_id),
-          file_vector_store_file_file_id = EXCLUDED.file_vector_store_file_file_id
+          file_vector_store_file_file_id = EXCLUDED.file_vector_store_file_file_id,
+          source_parent_kind = COALESCE(docs_files.source_parent_kind, EXCLUDED.source_parent_kind),
+          source_parent_sha256 = COALESCE(docs_files.source_parent_sha256, EXCLUDED.source_parent_sha256)
       `,
       [
         docId,
@@ -682,8 +693,43 @@ c.) Coalition building through service
         fileVectorStoreFileId,
         vectorStoreFileFileId,
         fileVectorStoreFileFileId,
+        sourceParentKind,
+        sourceParentSha256,
       ]
     );
+  }
+
+  async function attachExistingOpenAIFileToVectorStore_(vectorStoreId, openaiFileId) {
+    if (!vectorStoreId || !openaiFileId) {
+      return {
+        vectorStoreFileId: null,
+        vectorStoreFileFileId: null,
+      };
+    }
+
+    const filesApi = client?.vectorStores?.files;
+    if (!filesApi) {
+      throw new Error("OpenAI vector store files API is not available.");
+    }
+
+    let vsFile = null;
+    if (typeof filesApi.createAndPoll === "function") {
+      vsFile = await filesApi.createAndPoll(String(vectorStoreId), {
+        file_id: String(openaiFileId),
+      });
+    } else if (typeof filesApi.create === "function" && typeof filesApi.poll === "function") {
+      const created = await filesApi.create(String(vectorStoreId), {
+        file_id: String(openaiFileId),
+      });
+      vsFile = await filesApi.poll(String(vectorStoreId), String(created?.id || ""));
+    } else {
+      throw new Error("OpenAI vector store file attach API is not available.");
+    }
+
+    return {
+      vectorStoreFileId: vsFile?.id || null,
+      vectorStoreFileFileId: vsFile?.file_id || vsFile?.fileId || String(openaiFileId),
+    };
   }
 
   async function updateDocSummary_({ docId, title, kind, text, previousSummary }) {
@@ -718,17 +764,62 @@ c.) Coalition building through service
     return summary;
   }
 
-  async function ensureTables() {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS chat_history (
-        id SERIAL PRIMARY KEY,
-        doc_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
+  function scheduleDocSummaryUpdate_({ docId, title, kind, text, previousSummary }) {
+    if (!cfg.summaryEnabled) return;
 
+    setImmediate(() => {
+      Promise.resolve()
+        .then(async () => {
+          let latestSummary = previousSummary;
+          try {
+            const current = await pool.query(
+              `SELECT doc_summary FROM docs_sessions WHERE doc_id = $1 LIMIT 1`,
+              [String(docId)]
+            );
+            latestSummary = current.rows?.[0]?.doc_summary ?? previousSummary;
+          } catch (_) {
+            latestSummary = previousSummary;
+          }
+
+          await updateDocSummary_({
+            docId,
+            title,
+            kind,
+            text,
+            previousSummary: latestSummary,
+          });
+        })
+        .catch((err) => {
+          logger.error(err);
+        });
+    });
+  }
+
+  async function mapWithConcurrency_(items, limit, worker) {
+    const entries = Array.isArray(items) ? items : [];
+    if (!entries.length) return [];
+
+    const concurrency = Math.max(1, Number.parseInt(String(limit ?? 1), 10) || 1);
+    const results = new Array(entries.length);
+    let nextIndex = 0;
+
+    const runOne_ = async () => {
+      while (true) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        if (currentIndex >= entries.length) return;
+        results[currentIndex] = await worker(entries[currentIndex], currentIndex);
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, entries.length) }, () => runOne_())
+    );
+
+    return results;
+  }
+
+  async function ensureTables() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS docs_sessions (
         doc_id TEXT PRIMARY KEY,
@@ -755,6 +846,8 @@ c.) Coalition building through service
         file_vector_store_file_id TEXT,
         vector_store_file_file_id TEXT,
         file_vector_store_file_file_id TEXT,
+        source_parent_kind TEXT,
+        source_parent_sha256 TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
@@ -764,6 +857,8 @@ c.) Coalition building through service
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_file_id TEXT;`);
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS vector_store_file_file_id TEXT;`);
     await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS file_vector_store_file_file_id TEXT;`);
+    await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS source_parent_kind TEXT;`);
+    await pool.query(`ALTER TABLE docs_files ADD COLUMN IF NOT EXISTS source_parent_sha256 TEXT;`);
     await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary TEXT;`);
     await pool.query(`ALTER TABLE docs_sessions ADD COLUMN IF NOT EXISTS doc_summary_updated_at TIMESTAMPTZ;`);
 
@@ -819,9 +914,6 @@ c.) Coalition building through service
     // 3) Query performance.
     await pool.query(
       `CREATE INDEX IF NOT EXISTS docs_files_doc_id_idx ON docs_files (doc_id);`
-    );
-    await pool.query(
-      `CREATE INDEX IF NOT EXISTS chat_history_doc_id_created_at_idx ON chat_history (doc_id, created_at);`
     );
   }
 
@@ -905,19 +997,253 @@ c.) Coalition building through service
     const scopedFileId = n;
 
     try {
-      const f = await pool.query(
-        `
-          SELECT file_vector_store_id
-          FROM docs_files
-          WHERE doc_id = $1 AND id = $2
-          LIMIT 1
-        `,
-        [String(docId), scopedFileId]
-      );
-      const scopedVectorStoreId = f.rows?.[0]?.file_vector_store_id || null;
-      return { session, scopedVectorStoreId, scopedFileId };
+      const materialized = await materializeFileScopeForDocsFile_({
+        docId: String(docId),
+        docsFileId: scopedFileId,
+      });
+      return {
+        session,
+        scopedVectorStoreId: materialized?.scopedVectorStoreId || null,
+        scopedFileId,
+      };
     } catch (_) {
       return { session, scopedVectorStoreId: null, scopedFileId: null };
+    }
+  }
+
+  async function getDocsFileById_(db, { docId, docsFileId }) {
+    const result = await db.query(
+      `
+        SELECT
+          id,
+          doc_id,
+          kind,
+          filename,
+          sha256,
+          vector_store_file_id,
+          file_vector_store_id,
+          file_vector_store_file_id,
+          vector_store_file_file_id,
+          file_vector_store_file_file_id,
+          source_parent_kind,
+          source_parent_sha256,
+          created_at
+        FROM docs_files
+        WHERE doc_id = $1 AND id = $2
+        LIMIT 1
+      `,
+      [String(docId), Number(docsFileId)]
+    );
+    return result.rows?.[0] || null;
+  }
+
+  async function updateDocsFileScopeMetadataById_(db, { id, fileVectorStoreId, fileVectorStoreFileId, fileVectorStoreFileFileId }) {
+    await db.query(
+      `
+        UPDATE docs_files
+        SET
+          file_vector_store_id = $2,
+          file_vector_store_file_id = $3,
+          file_vector_store_file_file_id = $4
+        WHERE id = $1
+      `,
+      [Number(id), fileVectorStoreId, fileVectorStoreFileId, fileVectorStoreFileFileId]
+    );
+  }
+
+  async function listFileScopeSourceRows_(db, { docId, rootFile }) {
+    if (!rootFile) return [];
+
+    if (String(rootFile.kind) === "upload") {
+      return rootFile.vector_store_file_file_id
+        ? [
+            {
+              id: rootFile.id,
+              filename: rootFile.filename,
+              openaiFileId: rootFile.vector_store_file_file_id,
+            },
+          ]
+        : [];
+    }
+
+    const chunkKind =
+      String(rootFile.kind) === "doc" ? "doc_chunk" : String(rootFile.kind) === "tab" ? "tab_chunk" : null;
+    if (!chunkKind) {
+      return rootFile.vector_store_file_file_id
+        ? [
+            {
+              id: rootFile.id,
+              filename: rootFile.filename,
+              openaiFileId: rootFile.vector_store_file_file_id,
+            },
+          ]
+        : [];
+    }
+
+    const rows = await db.query(
+      `
+        SELECT id, filename, vector_store_file_file_id, created_at
+        FROM docs_files
+        WHERE doc_id = $1
+          AND kind = $2
+          AND source_parent_kind = $3
+          AND source_parent_sha256 = $4
+        ORDER BY created_at ASC, id ASC
+      `,
+      [String(docId), chunkKind, String(rootFile.kind), String(rootFile.sha256)]
+    );
+
+    const sources = (rows.rows || [])
+      .filter((row) => row && row.vector_store_file_file_id)
+      .map((row) => ({
+        id: row.id,
+        filename: row.filename,
+        openaiFileId: row.vector_store_file_file_id,
+      }));
+
+    if (sources.length) return sources;
+
+    return rootFile.vector_store_file_file_id
+      ? [
+          {
+            id: rootFile.id,
+            filename: rootFile.filename,
+            openaiFileId: rootFile.vector_store_file_file_id,
+          },
+        ]
+      : [];
+  }
+
+  async function materializeFileScopeForDocsFile_({ docId, docsFileId }) {
+    const normalizedDocId = String(docId || "").trim();
+    const numericFileId = Number.parseInt(String(docsFileId || ""), 10);
+    if (!normalizedDocId || !Number.isFinite(numericFileId) || numericFileId <= 0) {
+      return { scopedVectorStoreId: null, scopedFileId: null, materialized: false };
+    }
+
+    const runWithDb_ = async (db) => {
+      const rootFile = await getDocsFileById_(db, {
+        docId: normalizedDocId,
+        docsFileId: numericFileId,
+      });
+      if (!rootFile) {
+        return { scopedVectorStoreId: null, scopedFileId: numericFileId, materialized: false };
+      }
+
+      if (rootFile.file_vector_store_id) {
+        return {
+          scopedVectorStoreId: rootFile.file_vector_store_id,
+          scopedFileId: numericFileId,
+          materialized: false,
+        };
+      }
+
+      let createdFileVectorStoreId = null;
+      try {
+        const fileVectorStore = await client.vectorStores.create({
+          name: `docassist-${normalizedDocId}-${String(rootFile.kind || "file")}-${String(rootFile.id)}`,
+          metadata: {
+            doc_id: normalizedDocId,
+            docs_file_id: String(rootFile.id),
+            kind: String(rootFile.kind || "file"),
+            lazy_materialized: "true",
+          },
+        });
+        createdFileVectorStoreId = fileVectorStore?.id || null;
+        if (!createdFileVectorStoreId) {
+          throw new Error("Failed to create file-scoped vector store.");
+        }
+
+        const sourceRows = await listFileScopeSourceRows_(db, {
+          docId: normalizedDocId,
+          rootFile,
+        });
+        if (!sourceRows.length) {
+          throw new Error("No source files available for file-scope materialization.");
+        }
+
+        const uniqueSources = [];
+        const seenOpenAIFileIds = new Set();
+        for (const source of sourceRows) {
+          const openaiFileId = String(source.openaiFileId || "").trim();
+          if (!openaiFileId || seenOpenAIFileIds.has(openaiFileId)) continue;
+          seenOpenAIFileIds.add(openaiFileId);
+          uniqueSources.push({ ...source, openaiFileId });
+        }
+
+        const attachments = await mapWithConcurrency_(
+          uniqueSources,
+          cfg.chunkUploadConcurrency,
+          async (source) => ({
+            sourceId: source.id,
+            openaiFileId: source.openaiFileId,
+            ...(await attachExistingOpenAIFileToVectorStore_(createdFileVectorStoreId, source.openaiFileId)),
+          })
+        );
+        const attachmentByOpenAIFileId = new Map(
+          attachments.map((attachment) => [String(attachment.openaiFileId), attachment])
+        );
+
+        for (const source of sourceRows) {
+          const attachment = attachmentByOpenAIFileId.get(String(source.openaiFileId || ""));
+          if (!attachment) continue;
+          await updateDocsFileScopeMetadataById_(db, {
+            id: source.id,
+            fileVectorStoreId: createdFileVectorStoreId,
+            fileVectorStoreFileId: attachment.vectorStoreFileId,
+            fileVectorStoreFileFileId: attachment.vectorStoreFileFileId,
+          });
+        }
+
+        const firstAttachment = attachments[0] || null;
+        await updateDocsFileScopeMetadataById_(db, {
+          id: rootFile.id,
+          fileVectorStoreId: createdFileVectorStoreId,
+          fileVectorStoreFileId: firstAttachment?.vectorStoreFileId || null,
+          fileVectorStoreFileFileId: firstAttachment?.vectorStoreFileFileId || null,
+        });
+
+        return {
+          scopedVectorStoreId: createdFileVectorStoreId,
+          scopedFileId: numericFileId,
+          materialized: true,
+        };
+      } catch (err) {
+        await bestEffortDeleteOpenAIResources_({ vectorStoreId: createdFileVectorStoreId });
+        throw err;
+      }
+    };
+
+    if (typeof pool.connect !== "function") {
+      return runWithDb_(pool);
+    }
+
+    const db = await pool.connect();
+    let committed = false;
+    try {
+      await db.query("BEGIN");
+      await db.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+        `${normalizedDocId}:file-scope:${numericFileId}`,
+      ]);
+      const result = await runWithDb_(db);
+      await db.query("COMMIT");
+      committed = true;
+      return result;
+    } catch (err) {
+      if (!committed) {
+        try {
+          await db.query("ROLLBACK");
+        } catch (_) {
+          // best-effort
+        }
+      }
+      throw err;
+    } finally {
+      try {
+        db.release();
+      } catch (_) {
+        // ignore
+      }
     }
   }
 
@@ -1477,127 +1803,6 @@ c.) Coalition building through service
     }
   }
 
-  // ====== DB-ALAPÚ CHAT HISTORY STORE ======
-  async function getHistoryForDoc(docId) {
-    const result = await pool.query(
-      `
-      SELECT role, content
-      FROM chat_history
-      WHERE doc_id = $1
-      ORDER BY created_at ASC, id ASC
-      `,
-      [docId]
-    );
-
-    return result.rows.map((row) => ({
-      role: row.role,
-      content: row.content,
-    }));
-  }
-
-  async function appendToHistory(docId, role, content) {
-    await pool.query(
-      `
-      INSERT INTO chat_history (doc_id, role, content)
-      VALUES ($1, $2, $3)
-      `,
-      [docId, role, content]
-    );
-
-    const maxMessages = cfg.maxTurnsPerDoc * 2;
-
-    const countResult = await pool.query(
-      `
-      SELECT COUNT(*) AS cnt
-      FROM chat_history
-      WHERE doc_id = $1
-      `,
-      [docId]
-    );
-
-    const count = Number(countResult.rows[0].cnt);
-
-    if (count > maxMessages) {
-      const extra = count - maxMessages;
-
-      await pool.query(
-        `
-        DELETE FROM chat_history
-        WHERE id IN (
-          SELECT id FROM chat_history
-          WHERE doc_id = $1
-          ORDER BY created_at ASC, id ASC
-          LIMIT $2
-        )
-        `,
-        [docId, extra]
-      );
-    }
-  }
-
-  async function runDocsAgent(text, instruction) {
-    const response = await client.chat.completions.create({
-      model: cfg.openaiModel,
-      reasoning_effort: "high",
-      max_completion_tokens: cfg.maxOutputTokens,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: `Context:\n${text}\n\nInstruction:\n${instruction}` },
-      ],
-    });
-
-    if (!response.choices || response.choices.length === 0) {
-      throw new Error("No choices returned from model.");
-    }
-
-    const msg = response.choices[0].message;
-    if (!msg || !msg.content) {
-      throw new Error("No content in model response.");
-    }
-
-    return msg.content.trim();
-  }
-
-  async function runChatWithDoc(docId, docText, userMessage) {
-    const clippedDocText =
-      docText.length > cfg.maxDocChars ? docText.slice(0, cfg.maxDocChars) : docText;
-
-    const history = await getHistoryForDoc(docId);
-
-    const messages = [
-      { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "system",
-        content: `Here is the current document content (possibly truncated):\n\n${clippedDocText}`,
-      },
-      ...history,
-      { role: "user", content: userMessage },
-    ];
-
-    const response = await client.chat.completions.create({
-      model: cfg.openaiModel,
-      reasoning_effort: "high",
-      max_completion_tokens: cfg.maxOutputTokens,
-      messages,
-    });
-
-    if (!response.choices || response.choices.length === 0) {
-      throw new Error("No choices returned from model.");
-    }
-
-    const msg = response.choices[0].message;
-    if (!msg || !msg.content) {
-      throw new Error("No content in model response.");
-    }
-
-    const reply = msg.content.trim();
-
-    await appendToHistory(docId, "user", userMessage);
-    await appendToHistory(docId, "assistant", reply);
-
-    return reply;
-  }
-
   // Health check
   app.get("/", (req, res) => {
     res.send("Docs agent backend is running");
@@ -1662,7 +1867,6 @@ c.) Coalition building through service
         }
       }
 
-      const d1 = await pool.query(`DELETE FROM chat_history WHERE doc_id = $1`, [docId]);
       const d2 = await pool.query(`DELETE FROM docs_files WHERE doc_id = $1`, [docId]);
       const d3 = await pool.query(`DELETE FROM docs_sessions WHERE doc_id = $1`, [docId]);
 
@@ -1670,7 +1874,7 @@ c.) Coalition building through service
         ok: true,
         docId,
         deleted: {
-          chatHistory: d1.rowCount ?? 0,
+          chatHistory: 0,
           docsFiles: d2.rowCount ?? 0,
           docsSessions: d3.rowCount ?? 0,
         },
@@ -1720,6 +1924,7 @@ c.) Coalition building through service
           sha256: r.sha256,
           createdAt: r.created_at,
           hasFileScope: Boolean(r.file_vector_store_id),
+          fileScopeStatus: r.file_vector_store_id ? "ready" : "lazy",
         })),
       });
     } catch (err) {
@@ -2054,67 +2259,6 @@ c.) Coalition building through service
     }
   });
 
-  // ====== ENDPOINTOK ======
-  app.post("/docs-agent", async (req, res) => {
-    try {
-      if (!isPlainObject(req.body)) {
-        return res.status(400).json(jsonError(req, "Invalid JSON body"));
-      }
-
-      const text = requireString(req, res, "text", req.body.text, {
-        maxChars: cfg.maxDocTextChars,
-        allowEmpty: false,
-      });
-      if (text == null) return;
-
-      const instruction = requireNonEmptyTrimmedString(req, res, "instruction", req.body.instruction, {
-        maxChars: cfg.maxUserMessageChars,
-      });
-      if (instruction == null) return;
-
-      const resultText = await runDocsAgent(text, instruction);
-      return res.json({ resultText });
-    } catch (err) {
-      logger.error(err);
-      return res
-        .status(500)
-        .json(jsonError(req, err.message || "Internal server error"));
-    }
-  });
-
-  app.post("/chat-docs", async (req, res) => {
-    try {
-      if (!isPlainObject(req.body)) {
-        return res.status(400).json(jsonError(req, "Invalid JSON body"));
-      }
-
-      const docId = requireNonEmptyTrimmedString(req, res, "docId", req.body.docId, {
-        maxChars: cfg.maxDocIdChars,
-      });
-      if (docId == null) return;
-
-      // Keep legacy semantics: require non-empty docText.
-      const docText = requireString(req, res, "docText", req.body.docText, {
-        maxChars: cfg.maxDocTextChars,
-        allowEmpty: false,
-      });
-      if (docText == null) return;
-
-      const userMessage = requireNonEmptyTrimmedString(req, res, "userMessage", req.body.userMessage, {
-        maxChars: cfg.maxUserMessageChars,
-      });
-      if (userMessage == null) return;
-
-      const answer = await runChatWithDoc(docId, docText, userMessage);
-      return res.json({ reply: answer });
-    } catch (err) {
-      logger.error(err);
-      return res
-        .status(500)
-        .json(jsonError(req, err.message || "Internal server error"));
-    }
-  });
-
   // ====== V2 ======
   app.post("/v2/init", async (req, res) => {
     try {
@@ -2261,10 +2405,9 @@ c.) Coalition building through service
         throw new Error("No content to sync.");
       }
 
-      let firstDocVsfId = null;
-      let firstFileScopeVsfId = null;
-      let firstDocVsfFileId = null;
-      let firstFileScopeVsfFileId = null;
+      const plannedDocUploads = new Map();
+      const docUploadTasks = [];
+      const chunkPlans = [];
 
       for (let i = 0; i < chunks.length; i += 1) {
         const chunk = chunks[i];
@@ -2279,49 +2422,122 @@ c.) Coalition building through service
           chunkFilename = chunkFilename.slice(0, cfg.maxFilenameChars);
         }
 
-        let docVsfId = null;
-        let docVsfFileId = null;
+        let existingChunk = null;
         if (!replaceKnowledge) {
-          const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
-          docVsfId = existingChunk?.vector_store_file_id || null;
-          docVsfFileId = existingChunk?.vector_store_file_file_id || null;
+          existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
         }
 
-        if (!docVsfId) {
-          const uploadableChunk = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+        const plan = {
+          chunkFilename,
+          chunkHash,
+          chunkKind,
+          chunkText,
+          existingChunk,
+          docUploadTaskIndex: null,
+          fileScopeAttachTaskIndex: null,
+        };
+
+        if (!existingChunk?.vector_store_file_id) {
+          const reusedDocTaskIndex = plannedDocUploads.get(chunkHash);
+          if (reusedDocTaskIndex != null) {
+            plan.docUploadTaskIndex = reusedDocTaskIndex;
+          } else {
+            plan.docUploadTaskIndex = docUploadTasks.length;
+            plannedDocUploads.set(chunkHash, plan.docUploadTaskIndex);
+            docUploadTasks.push({
+              chunkFilename,
+              chunkText,
+              vectorStoreId: session.vector_store_id,
+            });
+          }
+        }
+
+        chunkPlans.push(plan);
+      }
+
+      const docUploadResults = await mapWithConcurrency_(
+        docUploadTasks,
+        cfg.chunkUploadConcurrency,
+        async (task) => {
+          const uploadableChunk = await toFile(Buffer.from(task.chunkText, "utf8"), task.chunkFilename, {
             type: "text/plain",
           });
-          const vsFile = await client.vectorStores.files.uploadAndPoll(
-            session.vector_store_id,
-            uploadableChunk
-          );
-          docVsfId = vsFile.id;
-          docVsfFileId = vsFile?.file_id || vsFile?.fileId || null;
+          const vsFile = await client.vectorStores.files.uploadAndPoll(task.vectorStoreId, uploadableChunk);
+          return {
+            vectorStoreFileId: vsFile?.id || null,
+            vectorStoreFileFileId: vsFile?.file_id || vsFile?.fileId || null,
+          };
+        }
+      );
+
+      const fileScopeAttachTasks = [];
+      const plannedFileScopeAttachments = new Map();
+      for (const plan of chunkPlans) {
+        if (!fileScopeEnabled || !fileVectorStoreId) continue;
+
+        const docUploadResult =
+          plan.docUploadTaskIndex != null ? docUploadResults[plan.docUploadTaskIndex] : null;
+        const docVsfFileId =
+          plan.existingChunk?.vector_store_file_file_id || docUploadResult?.vectorStoreFileFileId || null;
+        if (!docVsfFileId) continue;
+
+        const reusedAttachTaskIndex = plannedFileScopeAttachments.get(String(docVsfFileId));
+        if (reusedAttachTaskIndex != null) {
+          plan.fileScopeAttachTaskIndex = reusedAttachTaskIndex;
+          continue;
         }
 
-        let fileScopeVsf = null;
-        let fileScopeVsfFileId = null;
-        if (fileScopeEnabled && fileVectorStoreId) {
-          const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
-            type: "text/plain",
-          });
-          fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-            fileVectorStoreId,
-            uploadableFileScope
-          );
-          fileScopeVsfFileId = fileScopeVsf?.file_id || fileScopeVsf?.fileId || null;
-        }
-
-        await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
-          fileVectorStoreId: fileVectorStoreId,
-          fileVectorStoreFileId: fileScopeVsf?.id || null,
-          vectorStoreFileFileId: docVsfFileId,
-          fileVectorStoreFileFileId: fileScopeVsfFileId,
+        plan.fileScopeAttachTaskIndex = fileScopeAttachTasks.length;
+        plannedFileScopeAttachments.set(String(docVsfFileId), plan.fileScopeAttachTaskIndex);
+        fileScopeAttachTasks.push({
+          openaiFileId: docVsfFileId,
+          vectorStoreId: fileVectorStoreId,
         });
+      }
+
+      const fileScopeAttachResults = await mapWithConcurrency_(
+        fileScopeAttachTasks,
+        cfg.chunkUploadConcurrency,
+        async (task) => attachExistingOpenAIFileToVectorStore_(task.vectorStoreId, task.openaiFileId)
+      );
+
+      let firstDocVsfId = null;
+      let firstFileScopeVsfId = null;
+      let firstDocVsfFileId = null;
+      let firstFileScopeVsfFileId = null;
+
+      for (const plan of chunkPlans) {
+        const docUploadResult =
+          plan.docUploadTaskIndex != null ? docUploadResults[plan.docUploadTaskIndex] : null;
+        const fileScopeAttachResult =
+          plan.fileScopeAttachTaskIndex != null ? fileScopeAttachResults[plan.fileScopeAttachTaskIndex] : null;
+
+        const docVsfId =
+          plan.existingChunk?.vector_store_file_id || docUploadResult?.vectorStoreFileId || null;
+        const docVsfFileId =
+          plan.existingChunk?.vector_store_file_file_id || docUploadResult?.vectorStoreFileFileId || null;
+        const fileScopeVsfId = fileScopeAttachResult?.vectorStoreFileId || null;
+        const fileScopeVsfFileId = fileScopeAttachResult?.vectorStoreFileFileId || null;
+
+        await recordVectorStoreChunkFile(
+          String(docId),
+          plan.chunkKind,
+          plan.chunkFilename,
+          plan.chunkHash,
+          docVsfId,
+          {
+            fileVectorStoreId: fileVectorStoreId,
+            fileVectorStoreFileId: fileScopeVsfId,
+            vectorStoreFileFileId: docVsfFileId,
+            fileVectorStoreFileFileId: fileScopeVsfFileId,
+            sourceParentKind: "doc",
+            sourceParentSha256: docHash,
+          }
+        );
 
         if (!firstDocVsfId) {
           firstDocVsfId = docVsfId;
-          firstFileScopeVsfId = fileScopeVsf?.id || null;
+          firstFileScopeVsfId = fileScopeVsfId;
           firstDocVsfFileId = docVsfFileId;
           firstFileScopeVsfFileId = fileScopeVsfFileId;
         }
@@ -2345,17 +2561,13 @@ c.) Coalition building through service
         }
       );
 
-      try {
-        await updateDocSummary_({
-          docId: String(docId),
-          title: String(docTitle || ""),
-          kind: "doc",
-          text: formatted,
-          previousSummary: session.doc_summary,
-        });
-      } catch (e) {
-        logger.error(e);
-      }
+      scheduleDocSummaryUpdate_({
+        docId: String(docId),
+        title: String(docTitle || ""),
+        kind: "doc",
+        text: formatted,
+        previousSummary: session.doc_summary,
+      });
 
       // Best-effort: fetch docs_files id for UI convenience.
       const created = await findExistingDocsFileByHash_(String(docId), "doc", docHash);
@@ -2515,10 +2727,9 @@ c.) Coalition building through service
             throw new Error("No content to sync.");
           }
 
-          let firstDocVsfId = null;
-          let firstFileScopeVsfId = null;
-          let firstDocVsfFileId = null;
-          let firstFileScopeVsfFileId = null;
+          const plannedDocUploads = new Map();
+          const docUploadTasks = [];
+          const chunkPlans = [];
 
           for (let i = 0; i < chunks.length; i += 1) {
             const chunk = chunks[i];
@@ -2533,49 +2744,122 @@ c.) Coalition building through service
               chunkFilename = chunkFilename.slice(0, cfg.maxFilenameChars);
             }
 
-            let docVsfId = null;
-            let docVsfFileId = null;
+            let existingChunk = null;
             if (!replaceKnowledge) {
-              const existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
-              docVsfId = existingChunk?.vector_store_file_id || null;
-              docVsfFileId = existingChunk?.vector_store_file_file_id || null;
+              existingChunk = await findExistingDocsFileByHash_(String(docId), chunkKind, chunkHash);
             }
 
-            if (!docVsfId) {
-              const uploadableChunk = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
+            const plan = {
+              chunkFilename,
+              chunkHash,
+              chunkKind,
+              chunkText,
+              existingChunk,
+              docUploadTaskIndex: null,
+              fileScopeAttachTaskIndex: null,
+            };
+
+            if (!existingChunk?.vector_store_file_id) {
+              const reusedDocTaskIndex = plannedDocUploads.get(chunkHash);
+              if (reusedDocTaskIndex != null) {
+                plan.docUploadTaskIndex = reusedDocTaskIndex;
+              } else {
+                plan.docUploadTaskIndex = docUploadTasks.length;
+                plannedDocUploads.set(chunkHash, plan.docUploadTaskIndex);
+                docUploadTasks.push({
+                  chunkFilename,
+                  chunkText,
+                  vectorStoreId: session.vector_store_id,
+                });
+              }
+            }
+
+            chunkPlans.push(plan);
+          }
+
+          const docUploadResults = await mapWithConcurrency_(
+            docUploadTasks,
+            cfg.chunkUploadConcurrency,
+            async (task) => {
+              const uploadableChunk = await toFile(Buffer.from(task.chunkText, "utf8"), task.chunkFilename, {
                 type: "text/plain",
               });
-              const vsFile = await client.vectorStores.files.uploadAndPoll(
-                session.vector_store_id,
-                uploadableChunk
-              );
-              docVsfId = vsFile.id;
-              docVsfFileId = vsFile?.file_id || vsFile?.fileId || null;
+              const vsFile = await client.vectorStores.files.uploadAndPoll(task.vectorStoreId, uploadableChunk);
+              return {
+                vectorStoreFileId: vsFile?.id || null,
+                vectorStoreFileFileId: vsFile?.file_id || vsFile?.fileId || null,
+              };
+            }
+          );
+
+          const fileScopeAttachTasks = [];
+          const plannedFileScopeAttachments = new Map();
+          for (const plan of chunkPlans) {
+            if (!fileScopeEnabled || !fileVectorStoreId) continue;
+
+            const docUploadResult =
+              plan.docUploadTaskIndex != null ? docUploadResults[plan.docUploadTaskIndex] : null;
+            const docVsfFileId =
+              plan.existingChunk?.vector_store_file_file_id || docUploadResult?.vectorStoreFileFileId || null;
+            if (!docVsfFileId) continue;
+
+            const reusedAttachTaskIndex = plannedFileScopeAttachments.get(String(docVsfFileId));
+            if (reusedAttachTaskIndex != null) {
+              plan.fileScopeAttachTaskIndex = reusedAttachTaskIndex;
+              continue;
             }
 
-            let fileScopeVsf = null;
-            let fileScopeVsfFileId = null;
-            if (fileScopeEnabled && fileVectorStoreId) {
-              const uploadableFileScope = await toFile(Buffer.from(chunkText, "utf8"), chunkFilename, {
-                type: "text/plain",
-              });
-              fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-                fileVectorStoreId,
-                uploadableFileScope
-              );
-              fileScopeVsfFileId = fileScopeVsf?.file_id || fileScopeVsf?.fileId || null;
-            }
-
-            await recordVectorStoreChunkFile(String(docId), chunkKind, chunkFilename, chunkHash, docVsfId, {
-              fileVectorStoreId: fileVectorStoreId,
-              fileVectorStoreFileId: fileScopeVsf?.id || null,
-              vectorStoreFileFileId: docVsfFileId,
-              fileVectorStoreFileFileId: fileScopeVsfFileId,
+            plan.fileScopeAttachTaskIndex = fileScopeAttachTasks.length;
+            plannedFileScopeAttachments.set(String(docVsfFileId), plan.fileScopeAttachTaskIndex);
+            fileScopeAttachTasks.push({
+              openaiFileId: docVsfFileId,
+              vectorStoreId: fileVectorStoreId,
             });
+          }
+
+          const fileScopeAttachResults = await mapWithConcurrency_(
+            fileScopeAttachTasks,
+            cfg.chunkUploadConcurrency,
+            async (task) => attachExistingOpenAIFileToVectorStore_(task.vectorStoreId, task.openaiFileId)
+          );
+
+          let firstDocVsfId = null;
+          let firstFileScopeVsfId = null;
+          let firstDocVsfFileId = null;
+          let firstFileScopeVsfFileId = null;
+
+          for (const plan of chunkPlans) {
+            const docUploadResult =
+              plan.docUploadTaskIndex != null ? docUploadResults[plan.docUploadTaskIndex] : null;
+            const fileScopeAttachResult =
+              plan.fileScopeAttachTaskIndex != null ? fileScopeAttachResults[plan.fileScopeAttachTaskIndex] : null;
+
+            const docVsfId =
+              plan.existingChunk?.vector_store_file_id || docUploadResult?.vectorStoreFileId || null;
+            const docVsfFileId =
+              plan.existingChunk?.vector_store_file_file_id || docUploadResult?.vectorStoreFileFileId || null;
+            const fileScopeVsfId = fileScopeAttachResult?.vectorStoreFileId || null;
+            const fileScopeVsfFileId = fileScopeAttachResult?.vectorStoreFileFileId || null;
+
+            await recordVectorStoreChunkFile(
+              String(docId),
+              plan.chunkKind,
+              plan.chunkFilename,
+              plan.chunkHash,
+              docVsfId,
+              {
+                fileVectorStoreId: fileVectorStoreId,
+                fileVectorStoreFileId: fileScopeVsfId,
+                vectorStoreFileFileId: docVsfFileId,
+                fileVectorStoreFileFileId: fileScopeVsfFileId,
+                sourceParentKind: "tab",
+                sourceParentSha256: tabHash,
+              }
+            );
 
             if (!firstDocVsfId) {
               firstDocVsfId = docVsfId;
-              firstFileScopeVsfId = fileScopeVsf?.id || null;
+              firstFileScopeVsfId = fileScopeVsfId;
               firstDocVsfFileId = docVsfFileId;
               firstFileScopeVsfFileId = fileScopeVsfFileId;
             }
@@ -2599,17 +2883,13 @@ c.) Coalition building through service
             }
           );
 
-          try {
-            await updateDocSummary_({
-              docId: String(docId),
-              title: String(tabTitle || ""),
-              kind: "tab",
-              text: formatted,
-              previousSummary: session.doc_summary,
-            });
-          } catch (e) {
-            logger.error(e);
-          }
+          scheduleDocSummaryUpdate_({
+            docId: String(docId),
+            title: String(tabTitle || ""),
+            kind: "tab",
+            text: formatted,
+            previousSummary: session.doc_summary,
+          });
 
           // Best-effort: fetch docs_files id for UI convenience.
           const created = await findExistingDocsFileByHash_(String(docId), "tab", tabHash);
@@ -2772,34 +3052,35 @@ c.) Coalition building through service
         vsFile = await client.vectorStores.files.uploadAndPoll(session.vector_store_id, uploadableDoc);
       }
 
-      const uploadableFileScope = await toFile(buf, safeName, {
-        type: String(mimeType || "application/octet-stream"),
-      });
-      const fileScopeVsf = await client.vectorStores.files.uploadAndPoll(
-        fileVectorStoreId,
-        uploadableFileScope
-      );
+      const fileScopeVsf = vsFile?.file_id || vsFile?.fileId
+        ? await attachExistingOpenAIFileToVectorStore_(
+            fileVectorStoreId,
+            vsFile?.file_id || vsFile?.fileId
+          )
+        : await client.vectorStores.files.uploadAndPoll(
+            fileVectorStoreId,
+            await toFile(buf, safeName, {
+              type: String(mimeType || "application/octet-stream"),
+            })
+          );
 
       await recordVectorStoreFile(String(docId), "upload", safeName, hash, vsFile.id, {
         fileVectorStoreId,
-        fileVectorStoreFileId: fileScopeVsf?.id || null,
+        fileVectorStoreFileId: fileScopeVsf?.vectorStoreFileId || fileScopeVsf?.id || null,
         vectorStoreFileFileId: vsFile?.file_id || vsFile?.fileId || null,
-        fileVectorStoreFileFileId: fileScopeVsf?.file_id || fileScopeVsf?.fileId || null,
+        fileVectorStoreFileFileId:
+          fileScopeVsf?.vectorStoreFileFileId || fileScopeVsf?.file_id || fileScopeVsf?.fileId || null,
       });
 
       if (isLikelyTextMime(mimeType, safeName)) {
-        try {
-          const text = buf.toString("utf8");
-          await updateDocSummary_({
-            docId: String(docId),
-            title: String(filename || ""),
-            kind: "upload",
-            text,
-            previousSummary: session.doc_summary,
-          });
-        } catch (e) {
-          logger.error(e);
-        }
+        const text = buf.toString("utf8");
+        scheduleDocSummaryUpdate_({
+          docId: String(docId),
+          title: String(filename || ""),
+          kind: "upload",
+          text,
+          previousSummary: session.doc_summary,
+        });
       }
 
       const created = await findExistingDocsFileByHash_(String(docId), "upload", hash);
@@ -2859,24 +3140,16 @@ c.) Coalition building through service
       let scopedVectorStoreId = null;
       let scopedFileId = null;
       if (req.body.fileId != null && String(req.body.fileId).trim() !== "") {
-        const n = Number.parseInt(String(req.body.fileId), 10);
-        if (Number.isFinite(n) && n > 0) {
-          scopedFileId = n;
-          try {
-            const f = await pool.query(
-              `
-                SELECT file_vector_store_id
-                FROM docs_files
-                WHERE doc_id = $1 AND id = $2
-                LIMIT 1
-              `,
-              [String(docId), scopedFileId]
-            );
-            scopedVectorStoreId = f.rows?.[0]?.file_vector_store_id || null;
-          } catch (_) {
-            // best-effort: fall back to doc vector store
-            scopedVectorStoreId = null;
-          }
+        try {
+          const resolved = await resolveScopedVectorStoreIdForDoc_({
+            docId: String(docId),
+            fileId: String(req.body.fileId),
+          });
+          scopedVectorStoreId = resolved?.scopedVectorStoreId || null;
+          scopedFileId = resolved?.scopedFileId || null;
+        } catch (_) {
+          scopedVectorStoreId = null;
+          scopedFileId = null;
         }
       }
 
@@ -2884,13 +3157,6 @@ c.) Coalition building through service
       const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
       if (askedModel) {
         const replyText = `A backend szerint ezzel a modellel hívlak: ${session.model || cfg.openaiModel}`;
-
-        try {
-          await appendToHistory(String(docId), "user", msgStr);
-          await appendToHistory(String(docId), "assistant", replyText);
-        } catch (e) {
-          logger.error(e);
-        }
 
         return res.json({
           reply: replyText,
@@ -2964,13 +3230,6 @@ c.) Coalition building through service
           snippet: clipSnippet(s.quote),
         };
       });
-
-      try {
-        await appendToHistory(String(docId), "user", msgStr);
-        await appendToHistory(String(docId), "assistant", replyText);
-      } catch (e) {
-        logger.error(e);
-      }
 
       const usage = response?.usage || {};
       logChatEvent_({
