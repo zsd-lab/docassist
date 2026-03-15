@@ -217,6 +217,8 @@ function getChatSidebarHtml_() {
       .chat code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 12px; }
       .chat pre { margin: 8px 0; padding: 8px; border: 1px solid #dadce0; border-radius: 6px; background: #fff; overflow: auto; }
       .chat pre code { white-space: pre; }
+      .generated-files { margin: 6px 0 10px 0; padding-left: 18px; }
+      .generated-files .file-link { margin-right: 8px; }
     </style>
   </head>
   <body>
@@ -662,8 +664,12 @@ function getChatSidebarHtml_() {
             for (const m of (Array.isArray(msgs) ? msgs : [])) {
               const role = String(m.role || '');
               const text = String(m.content || '');
-              if (role === 'assistant') addMsg('Assistant', text);
-              else addMsg('You', text);
+              if (role === 'assistant') {
+                addMsg('Assistant', text);
+                if (m && Array.isArray(m.generatedFiles) && m.generatedFiles.length) {
+                  addGeneratedFiles_(m.generatedFiles);
+                }
+              } else addMsg('You', text);
             }
 
             google.script.run
@@ -782,6 +788,84 @@ function getChatSidebarHtml_() {
 
         div.appendChild(roleSpan);
         div.appendChild(textSpan);
+        el('chat').appendChild(div);
+        el('chat').scrollTop = el('chat').scrollHeight;
+      }
+
+      function base64ToUint8Array_(base64) {
+        const binary = atob(String(base64 || ''));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      }
+
+      function triggerBrowserDownload_(download) {
+        const bytes = base64ToUint8Array_(download && download.base64 ? download.base64 : '');
+        const blob = new Blob([bytes], {
+          type: (download && download.mimeType) || 'application/octet-stream'
+        });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = (download && download.filename) || 'download.bin';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      function downloadGeneratedFile_(file) {
+        const filename = file && file.filename ? String(file.filename) : 'download.bin';
+        setStatus('Preparing download: ' + filename + '...');
+        google.script.run
+          .withSuccessHandler((resp) => {
+            triggerBrowserDownload_(resp || {});
+            setStatus('Downloaded: ' + filename);
+          })
+          .withFailureHandler((err) => {
+            setStatus('Download failed: ' + (err && err.message ? err.message : err));
+          })
+          .getGeneratedFileDownloadForCurrentUser(
+            file && file.containerId ? String(file.containerId) : '',
+            file && file.fileId ? String(file.fileId) : '',
+            filename
+          );
+      }
+
+      function addGeneratedFiles_(files) {
+        const list = Array.isArray(files) ? files : [];
+        if (!list.length) return;
+
+        const div = document.createElement('div');
+        div.className = 'msg';
+
+        const roleSpan = document.createElement('span');
+        roleSpan.className = 'role';
+        roleSpan.textContent = 'Files:';
+
+        const body = document.createElement('div');
+        body.className = 'generated-files';
+
+        list.forEach((file) => {
+          const row = document.createElement('div');
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'file-link';
+          btn.textContent = 'Download';
+          btn.addEventListener('click', () => downloadGeneratedFile_(file));
+
+          const label = document.createElement('span');
+          const filename = file && file.filename ? String(file.filename) : 'download.bin';
+          const suffix = file && file.isSpreadsheet ? ' (spreadsheet)' : '';
+          label.textContent = filename + suffix;
+
+          row.appendChild(btn);
+          row.appendChild(label);
+          body.appendChild(row);
+        });
+
+        div.appendChild(roleSpan);
+        div.appendChild(body);
         el('chat').appendChild(div);
         el('chat').scrollTop = el('chat').scrollHeight;
       }
@@ -1372,6 +1456,10 @@ function getChatSidebarHtml_() {
               const replyText = (resp && typeof resp.reply !== 'undefined') ? resp.reply : resp;
               addMsg('Assistant', replyText || '(empty)');
 
+              if (resp && resp.generatedFiles && Array.isArray(resp.generatedFiles) && resp.generatedFiles.length) {
+                addGeneratedFiles_(resp.generatedFiles);
+              }
+
               if (resp && resp.sources && Array.isArray(resp.sources) && resp.sources.length) {
                 addSources_(resp.sources);
               }
@@ -1843,6 +1931,43 @@ function callBackendV2Get_(path) {
   return json;
 }
 
+function getGeneratedFileDownloadForCurrentUser(containerId, fileId, filename) {
+  const url =
+    getBackendBaseUrl_() +
+    '/v2/generated-files/' + encodeURIComponent(String(containerId || '')) + '/' + encodeURIComponent(String(fileId || '')) +
+    '?filename=' + encodeURIComponent(String(filename || 'download.bin'));
+  const token = getBackendToken_();
+
+  const headers = {};
+  if (token) headers.Authorization = 'Bearer ' + token;
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: headers,
+    muteHttpExceptions: true,
+  });
+
+  const responseCode = response.getResponseCode();
+  if (responseCode < 200 || responseCode >= 300) {
+    const responseText = response.getContentText();
+    let json;
+    try {
+      json = responseText ? JSON.parse(responseText) : {};
+    } catch (e) {
+      json = null;
+    }
+    const errorMsg = json && json.error ? json.error : (responseText || 'Download failed');
+    throw new Error(errorMsg + ' (HTTP ' + responseCode + ')');
+  }
+
+  const blob = response.getBlob();
+  const safeName = String(filename || blob.getName() || 'download.bin').trim() || 'download.bin';
+  return {
+    filename: safeName,
+    mimeType: blob.getContentType() || 'application/octet-stream',
+    base64: Utilities.base64Encode(blob.getBytes())
+  };
+}
 function getBackendInfo() {
   return callBackendV2Get_('/v2/info');
 }

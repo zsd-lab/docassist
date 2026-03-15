@@ -135,6 +135,265 @@ test("POST /v2/chat replies without persisting duplicate local doc turns", async
   assert.equal(res.body.reply, "Hello from OpenAI");
 });
 
+test("POST /v2/chat returns generated spreadsheet files", async () => {
+  const openaiClient = {
+    responses: {
+      async create() {
+        return {
+          id: "r_gen",
+          output_text: "I created the workbook.",
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "I created the workbook.",
+                  annotations: [
+                    {
+                      type: "container_file_citation",
+                      container_id: "cont_1",
+                      file_id: "file_1",
+                      filename: "report.xlsx",
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      sessionRow: {
+        doc_id: "doc1",
+        conversation_id: "c1",
+        vector_store_id: "vs1",
+        instructions: "",
+        model: "test-model",
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chat")
+    .send({ docId: "doc1", userMessage: "Create an Excel workbook with the totals." });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reply, "I created the workbook.");
+  assert.deepEqual(res.body.generatedFiles, [
+    {
+      containerId: "cont_1",
+      fileId: "file_1",
+      filename: "report.xlsx",
+      isSpreadsheet: true,
+      downloadPath: "/v2/generated-files/cont_1/file_1?filename=report.xlsx",
+    },
+  ]);
+});
+
+test("GET /v2/generated-files streams container file downloads", async () => {
+  const openaiClient = {
+    containers: {
+      files: {
+        content: {
+          async retrieve(fileId, options) {
+            assert.equal(fileId, "file_1");
+            assert.deepEqual(options, { container_id: "cont_1" });
+            return new Response(Buffer.from("a,b\n1,2\n"), {
+              headers: { "content-type": "text/csv; charset=utf-8" },
+            });
+          },
+        },
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock(),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "" },
+  });
+
+  const res = await request(app)
+    .get("/v2/generated-files/cont_1/file_1")
+    .query({ filename: "report.csv" });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.text, "a,b\n1,2\n");
+  assert.match(res.headers["content-disposition"], /report\.csv/);
+  assert.match(res.headers["content-type"], /text\/csv/i);
+});
+
+test("POST /v2/chats/:chatId/send persists generated file metadata", async () => {
+  const insertedMessages = [];
+  const openaiClient = {
+    responses: {
+      async create(payload) {
+        assert.ok(Array.isArray(payload.tools));
+        assert.ok(payload.tools.some((tool) => tool.type === "code_interpreter"));
+        return {
+          id: "r_thread",
+          output_text: "Done.",
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "Done.",
+                  annotations: [
+                    {
+                      type: "container_file_citation",
+                      container_id: "cont_thread",
+                      file_id: "file_thread",
+                      filename: "thread.xlsx",
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("FROM chats") && q.includes("WHERE id = $1 AND user_id = $2")) {
+          return {
+            rows: [
+              {
+                id: "chat1",
+                user_id: "user1",
+                title: "New chat",
+                openai_conversation_id: "conv1",
+                archived_at: null,
+                created_at: "2025-01-01T00:00:00.000Z",
+                updated_at: "2025-01-01T00:00:00.000Z",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (q.includes("INSERT INTO chat_messages")) {
+          insertedMessages.push(params);
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("UPDATE chats SET title = $2")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("UPDATE chats SET updated_at = NOW()")) {
+          return { rows: [], rowCount: 1 };
+        }
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chats/chat1/send")
+    .send({ userId: "user1", userMessage: "Create an Excel export for me." });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reply, "Done.");
+  assert.equal(insertedMessages.length, 2);
+  assert.equal(insertedMessages[0][1], "user");
+  assert.equal(insertedMessages[1][1], "assistant");
+  assert.deepEqual(insertedMessages[1][3], {
+    generatedFiles: [
+      {
+        containerId: "cont_thread",
+        fileId: "file_thread",
+        filename: "thread.xlsx",
+        isSpreadsheet: true,
+        downloadPath: "/v2/generated-files/cont_thread/file_thread?filename=thread.xlsx",
+      },
+    ],
+  });
+});
+
+test("GET /v2/chats/:chatId/messages returns generated files from metadata", async () => {
+  const { app } = createApp({
+    pool: makePoolMock({
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("FROM chats") && q.includes("WHERE id = $1 AND user_id = $2")) {
+          assert.deepEqual(params, ["chat1", "user1"]);
+          return {
+            rows: [
+              {
+                id: "chat1",
+                user_id: "user1",
+                title: "Budget chat",
+                openai_conversation_id: "conv1",
+                archived_at: null,
+                created_at: "2025-01-01T00:00:00.000Z",
+                updated_at: "2025-01-01T00:00:00.000Z",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (q.includes("FROM chat_messages")) {
+          assert.deepEqual(params, ["chat1", 200]);
+          return {
+            rows: [
+              {
+                id: 10,
+                role: "assistant",
+                content: "Here is the file.",
+                metadata: {
+                  generatedFiles: [
+                    {
+                      containerId: "cont_saved",
+                      fileId: "file_saved",
+                      filename: "saved.xlsx",
+                      isSpreadsheet: true,
+                      downloadPath: "/v2/generated-files/cont_saved/file_saved?filename=saved.xlsx",
+                    },
+                  ],
+                },
+                created_at: "2025-01-01T00:00:01.000Z",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        return null;
+      },
+    }),
+    openaiClient: {},
+    config: { bodyLimit: "10kb", token: "" },
+  });
+
+  const res = await request(app)
+    .get("/v2/chats/chat1/messages")
+    .query({ userId: "user1" });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.messages.length, 1);
+  assert.deepEqual(res.body.messages[0].generatedFiles, [
+    {
+      containerId: "cont_saved",
+      fileId: "file_saved",
+      filename: "saved.xlsx",
+      isSpreadsheet: true,
+      downloadPath: "/v2/generated-files/cont_saved/file_saved?filename=saved.xlsx",
+    },
+  ]);
+});
+
 test("Oversized body returns JSON 413", async () => {
   const { app } = createApp({
     pool: makePoolMock(),

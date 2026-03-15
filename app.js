@@ -551,6 +551,7 @@ c.) Coalition building through service
       for (const c of content) {
         const annotations = c && Array.isArray(c.annotations) ? c.annotations : [];
         for (const ann of annotations) {
+          if (String(ann?.type || "").toLowerCase() === "container_file_citation") continue;
           const fileId = ann.file_id || ann.fileId || ann?.file?.id;
           if (!fileId) continue;
           const quote = ann.quote || ann.text || c.text || "";
@@ -580,6 +581,83 @@ c.) Coalition building through service
     }
 
     return Array.from(dedup.values());
+  }
+
+  function extractGeneratedFilesFromResponse_(response) {
+    const generatedFiles = [];
+    const output = response && Array.isArray(response.output) ? response.output : [];
+
+    for (const item of output) {
+      const content = item && Array.isArray(item.content) ? item.content : [];
+      for (const c of content) {
+        const annotations = c && Array.isArray(c.annotations) ? c.annotations : [];
+        for (const ann of annotations) {
+          if (String(ann?.type || "").toLowerCase() !== "container_file_citation") continue;
+          const containerId = ann.container_id || ann.containerId;
+          const fileId = ann.file_id || ann.fileId;
+          if (!containerId || !fileId) continue;
+          generatedFiles.push({
+            containerId: String(containerId),
+            fileId: String(fileId),
+            filename: String(ann.filename || fileId),
+          });
+        }
+      }
+    }
+
+    const dedup = new Map();
+    for (const file of generatedFiles) {
+      const key = `${file.containerId}::${file.fileId}`;
+      if (!dedup.has(key)) dedup.set(key, file);
+    }
+
+    return Array.from(dedup.values());
+  }
+
+  function isSpreadsheetLikeFilename_(filename) {
+    const name = String(filename || "").trim().toLowerCase();
+    return /\.(xlsx|xls|csv|tsv|ods)$/i.test(name);
+  }
+
+  function shouldEnableCodeInterpreter_(msg, scopedDocsFile) {
+    if (scopedDocsFile && String(scopedDocsFile.kind || "") === "upload") return true;
+    const s = String(msg || "");
+    if (!s.trim()) return false;
+    return /(excel|xlsx|xls|csv|tsv|spreadsheet|workbook|sheet\b|downloadable file|download link|generate file|create file|export)/i.test(s);
+  }
+
+  function guessMimeTypeFromFilename_(filename) {
+    const name = String(filename || "").trim().toLowerCase();
+    if (name.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    if (name.endsWith(".xls")) return "application/vnd.ms-excel";
+    if (name.endsWith(".csv")) return "text/csv; charset=utf-8";
+    if (name.endsWith(".tsv")) return "text/tab-separated-values; charset=utf-8";
+    if (name.endsWith(".json")) return "application/json; charset=utf-8";
+    if (name.endsWith(".txt")) return "text/plain; charset=utf-8";
+    if (name.endsWith(".zip")) return "application/zip";
+    return "application/octet-stream";
+  }
+
+  function safeDownloadFilename_(filename, fallback = "download.bin") {
+    const normalized = String(filename || "")
+      .trim()
+      .replace(/[\r\n\\/]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return normalized || fallback;
+  }
+
+  function decorateGeneratedFilesForResponse_(files) {
+    const list = Array.isArray(files) ? files : [];
+    return list.map((file) => ({
+      containerId: String(file.containerId),
+      fileId: String(file.fileId),
+      filename: String(file.filename || file.fileId),
+      isSpreadsheet: isSpreadsheetLikeFilename_(file.filename),
+      downloadPath:
+        `/v2/generated-files/${encodeURIComponent(String(file.containerId))}/${encodeURIComponent(String(file.fileId))}` +
+        `?filename=${encodeURIComponent(String(file.filename || file.fileId || "download.bin"))}`,
+    }));
   }
 
   async function resolveSourceMetadata_(docId, fileIds) {
@@ -883,9 +961,11 @@ c.) Coalition building through service
         chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
         role TEXT NOT NULL,
         content TEXT NOT NULL,
+        metadata JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+    await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS metadata JSONB;`);
 
     await pool.query(`CREATE INDEX IF NOT EXISTS chats_user_id_updated_at_idx ON chats (user_id, updated_at);`);
     await pool.query(`CREATE INDEX IF NOT EXISTS chat_messages_chat_id_created_at_idx ON chat_messages (chat_id, created_at);`);
@@ -972,12 +1052,62 @@ c.) Coalition building through service
     return result.rows?.[0] || null;
   }
 
-  async function appendChatMessage_({ chatId, role, content }) {
+  async function appendChatMessage_({ chatId, role, content, metadata = null }) {
     await pool.query(
-      `INSERT INTO chat_messages (chat_id, role, content) VALUES ($1, $2, $3)`,
-      [String(chatId), String(role), String(content || "")]
+      `INSERT INTO chat_messages (chat_id, role, content, metadata) VALUES ($1, $2, $3, $4)`,
+      [String(chatId), String(role), String(content || ""), metadata]
     );
     await pool.query(`UPDATE chats SET updated_at = NOW() WHERE id = $1`, [String(chatId)]);
+  }
+
+  async function resolveCodeInterpreterInputFilesForScope_({ docId, fileId }) {
+    if (!docId || !fileId) return { docsFile: null, openaiFileIds: [] };
+
+    const scopedDocsFile = await getDocsFileById_(pool, {
+      docId: String(docId),
+      docsFileId: Number(fileId),
+    });
+    if (!scopedDocsFile) return { docsFile: null, openaiFileIds: [] };
+
+    const openaiFileId = String(scopedDocsFile.vector_store_file_file_id || "").trim();
+    if (String(scopedDocsFile.kind || "") !== "upload" || !openaiFileId) {
+      return { docsFile: scopedDocsFile, openaiFileIds: [] };
+    }
+
+    return {
+      docsFile: scopedDocsFile,
+      openaiFileIds: [openaiFileId],
+    };
+  }
+
+  function buildChatTools_({ vectorStoreId, enableCodeInterpreter, codeInterpreterFileIds }) {
+    const tools = [];
+
+    if (vectorStoreId) {
+      tools.push({
+        type: "file_search",
+        vector_store_ids: [String(vectorStoreId)],
+      });
+    }
+
+    if (enableCodeInterpreter) {
+      const ids = Array.isArray(codeInterpreterFileIds)
+        ? codeInterpreterFileIds.filter(Boolean).map((value) => String(value))
+        : [];
+      const container = {
+        type: "auto",
+        memory_limit: "1g",
+      };
+      if (ids.length) {
+        container.file_ids = ids;
+      }
+      tools.push({
+        type: "code_interpreter",
+        container,
+      });
+    }
+
+    return tools;
   }
 
   async function maybeAutoTitleChat_({ chatId, existingTitle, firstUserMessage }) {
@@ -2100,7 +2230,7 @@ c.) Coalition building through service
 
       const result = await pool.query(
         `
-          SELECT id, role, content, created_at
+          SELECT id, role, content, metadata, created_at
           FROM chat_messages
           WHERE chat_id = $1
           ORDER BY created_at ASC, id ASC
@@ -2123,12 +2253,60 @@ c.) Coalition building through service
           id: r.id,
           role: r.role,
           content: r.content,
+          metadata: r.metadata || null,
+          generatedFiles: Array.isArray(r.metadata?.generatedFiles) ? r.metadata.generatedFiles : [],
           createdAt: r.created_at,
         })),
       });
     } catch (err) {
       logger.error(err);
       return res.status(500).json(jsonError(req, "Server error"));
+    }
+  });
+  
+  app.get("/v2/generated-files/:containerId/:fileId", async (req, res) => {
+    try {
+      const containerId = requireNonEmptyTrimmedString(
+        req,
+        res,
+        "containerId",
+        req.params.containerId,
+        { maxChars: 200 }
+      );
+      if (containerId == null) return;
+  
+      const fileId = requireNonEmptyTrimmedString(req, res, "fileId", req.params.fileId, {
+        maxChars: 200,
+      });
+      if (fileId == null) return;
+  
+      const requestedFilename =
+        typeof req.query.filename === "undefined"
+          ? null
+          : requireString(req, res, "filename", req.query.filename, {
+              maxChars: 255,
+              allowEmpty: true,
+            });
+      if (typeof req.query.filename !== "undefined" && requestedFilename == null) return;
+  
+      const upstream = await client.containers.files.content.retrieve(String(fileId), {
+        container_id: String(containerId),
+      });
+      const bodyBuffer = Buffer.from(await upstream.arrayBuffer());
+      const safeFilename = safeDownloadFilename_(requestedFilename, String(fileId));
+      const contentType =
+        upstream.headers.get("content-type") || guessMimeTypeFromFilename_(safeFilename);
+  
+      res.setHeader("Content-Type", contentType);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeFilename.replace(/"/g, "")}"`
+      );
+      return res.status(200).send(bodyBuffer);
+    } catch (err) {
+      logger.error(err);
+      const status = Number(err?.status) || 500;
+      return res.status(status).json(jsonError(req, err.message || "Internal server error"));
     }
   });
 
@@ -2188,11 +2366,22 @@ c.) Coalition building through service
       let scopedVectorStoreId = null;
       let scopedFileId = null;
       let session = null;
+      let scopedDocsFile = null;
+      let codeInterpreterFileIds = [];
       if (String(docId || "").trim()) {
         const resolved = await resolveScopedVectorStoreIdForDoc_({ docId: String(docId), fileId: String(fileId || "").trim() });
         session = resolved.session;
         scopedVectorStoreId = resolved.scopedVectorStoreId;
         scopedFileId = resolved.scopedFileId;
+
+        if (scopedFileId) {
+          const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScope_({
+            docId: String(docId),
+            fileId: scopedFileId,
+          });
+          scopedDocsFile = codeInterpreterInputs.docsFile;
+          codeInterpreterFileIds = codeInterpreterInputs.openaiFileIds;
+        }
 
         // Ensure session uses the requested instructions (updates docs_sessions if changed).
         if (typeof instructions === "string" && instructions.trim() !== String(session.instructions || "").trim()) {
@@ -2200,25 +2389,35 @@ c.) Coalition building through service
         }
       }
 
-      const useTools = Boolean(session && (scopedVectorStoreId || session.vector_store_id));
+      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFile);
+      const tools = buildChatTools_({
+        vectorStoreId: session ? scopedVectorStoreId || session.vector_store_id : null,
+        enableCodeInterpreter,
+        codeInterpreterFileIds,
+      });
       const response = await client.responses.create({
         model: cfg.openaiModel,
         conversation: String(chat.openai_conversation_id),
-        instructions: session ? buildInstructions(session.instructions, session.doc_summary) : SYSTEM_PROMPT,
-        tools: useTools
-          ? [
-              {
-                type: "file_search",
-                vector_store_ids: [scopedVectorStoreId || session.vector_store_id],
-              },
-            ]
-          : [],
+        instructions: session
+          ? buildInstructions(session.instructions, session.doc_summary) +
+            (enableCodeInterpreter
+              ? "\n\nIf the user asks for a downloadable file, spreadsheet, CSV, or Excel workbook, use the python tool to create the file and mention that a downloadable attachment is available."
+              : "")
+          : SYSTEM_PROMPT,
+        tools,
+        include: enableCodeInterpreter ? ["code_interpreter_call.outputs"] : undefined,
         input: msgStr,
         max_output_tokens: cfg.maxOutputTokens,
       });
 
       const replyText = String(response.output_text || "").trim();
-      await appendChatMessage_({ chatId: String(chatId), role: "assistant", content: replyText });
+      const generatedFiles = decorateGeneratedFilesForResponse_(extractGeneratedFilesFromResponse_(response));
+      await appendChatMessage_({
+        chatId: String(chatId),
+        role: "assistant",
+        content: replyText,
+        metadata: generatedFiles.length ? { generatedFiles } : null,
+      });
 
       const usedSources = extractSourcesFromResponse_(response);
       const sourceFileIds = usedSources.map((s) => s.fileId).filter(Boolean);
@@ -2242,6 +2441,7 @@ c.) Coalition building through service
         fileId: scopedFileId || null,
         model: cfg.openaiModel,
         usedSources: sources.length,
+        generatedFiles: generatedFiles.length,
         usage: response?.usage || {},
         latencyMs: Date.now() - started,
       });
@@ -2252,6 +2452,7 @@ c.) Coalition building through service
         reply: replyText,
         responseId: response.id,
         sources,
+        generatedFiles,
       });
     } catch (err) {
       logger.error(err);
@@ -3139,6 +3340,8 @@ c.) Coalition building through service
 
       let scopedVectorStoreId = null;
       let scopedFileId = null;
+      let scopedDocsFile = null;
+      let codeInterpreterFileIds = [];
       if (req.body.fileId != null && String(req.body.fileId).trim() !== "") {
         try {
           const resolved = await resolveScopedVectorStoreIdForDoc_({
@@ -3165,35 +3368,60 @@ c.) Coalition building through service
       }
 
       const forceSearch = cfg.forceFileSearch && shouldForceFileSearch(msgStr);
+      if (scopedFileId) {
+        const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScope_({
+          docId: String(docId),
+          fileId: scopedFileId,
+        });
+        scopedDocsFile = codeInterpreterInputs.docsFile;
+        codeInterpreterFileIds = codeInterpreterInputs.openaiFileIds;
+      }
+
+      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFile);
+      const tools = buildChatTools_({
+        vectorStoreId: scopedVectorStoreId || session.vector_store_id,
+        enableCodeInterpreter,
+        codeInterpreterFileIds,
+      });
+      const baseInstructions =
+        buildInstructions(session.instructions, session.doc_summary) +
+        (enableCodeInterpreter
+          ? "\n\nIf the user asks for a downloadable file, spreadsheet, CSV, or Excel workbook, use the python tool to create the file and mention that a downloadable attachment is available."
+          : "");
       const baseRequest = {
         model: session.model || cfg.openaiModel,
         conversation: session.conversation_id,
-        instructions: buildInstructions(session.instructions, session.doc_summary),
-        tools: [
-          {
-            type: "file_search",
-            vector_store_ids: [scopedVectorStoreId || session.vector_store_id],
-          },
-        ],
+        instructions: baseInstructions,
+        tools,
+        include: enableCodeInterpreter ? ["code_interpreter_call.outputs"] : undefined,
         input: msgStr,
         max_output_tokens: cfg.maxOutputTokens,
       };
-      if (forceSearch) {
+      if (forceSearch && tools.some((tool) => tool.type === "file_search")) {
         baseRequest.tool_choice = { type: "file_search" };
       }
 
       let response;
       let usedSources = [];
 
-      if (cfg.twoStepEnabled && isComplexPrompt(msgStr)) {
+      if (forceSearch && tools.some((tool) => tool.type === "file_search")) {
         const planInput =
-          "You must use file_search. Return a brief plan and 3-6 quoted passages.\n" +
-          "Format:\nPLAN: <2-5 bullets>\nPASSAGES:\n- <quote>\n- <quote>\n" +
+          "Search the knowledge base and return the most relevant passages for the user question. " +
+          "Quote short verbatim excerpts and include enough context to answer accurately." +
           `\nQuestion: ${msgStr}`;
-
         const planResponse = await client.responses.create({
-          ...baseRequest,
+          model: session.model || cfg.openaiModel,
+          conversation: session.conversation_id,
+          instructions: baseInstructions,
+          tools: [
+            {
+              type: "file_search",
+              vector_store_ids: [scopedVectorStoreId || session.vector_store_id],
+            },
+          ],
+          tool_choice: { type: "file_search" },
           input: planInput,
+          max_output_tokens: cfg.maxOutputTokens,
         });
 
         usedSources = extractSourcesFromResponse_(planResponse);
@@ -3217,6 +3445,7 @@ c.) Coalition building through service
       }
 
       const replyText = String(response.output_text || "").trim();
+  const generatedFiles = decorateGeneratedFilesForResponse_(extractGeneratedFilesFromResponse_(response));
       const sourceFileIds = usedSources.map((s) => s.fileId).filter(Boolean);
       const fileMeta = await resolveSourceMetadata_(String(docId), sourceFileIds);
       const sources = usedSources.map((s) => {
@@ -3240,6 +3469,7 @@ c.) Coalition building through service
         forceSearch: Boolean(forceSearch),
         twoStep: Boolean(cfg.twoStepEnabled && isComplexPrompt(msgStr)),
         usedSources: sources.length,
+        generatedFiles: generatedFiles.length,
         usage,
         latencyMs: Date.now() - started,
       });
@@ -3248,6 +3478,7 @@ c.) Coalition building through service
         reply: replyText,
         responseId: response.id,
         sources,
+        generatedFiles,
         scope: scopedVectorStoreId
           ? { type: "file", fileId: scopedFileId }
           : { type: "all" },
