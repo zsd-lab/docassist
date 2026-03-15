@@ -300,11 +300,11 @@ function getChatSidebarHtml_() {
 
     <div class="row">
       <label>Files</label>
-      <input id="fileInput" type="file" />
+      <input id="fileInput" type="file" multiple />
       <div class="controls" style="margin-top:6px;">
-        <button id="uploadBtn">Upload File</button>
+        <button id="uploadBtn">Upload Files</button>
       </div>
-      <div class="small">Uploads and indexes the file for file search.</div>
+      <div class="small">Uploads and indexes one or more files for file search.</div>
     </div>
 
     <div class="row">
@@ -1285,14 +1285,13 @@ function getChatSidebarHtml_() {
       });
 
       el('uploadBtn').addEventListener('click', async () => {
-        const file = el('fileInput').files && el('fileInput').files[0];
-        if (!file) {
-          setStatus('Choose a file first.');
+        const files = Array.from((el('fileInput').files || []));
+        if (!files.length) {
+          setStatus('Choose one or more files first.');
           return;
         }
-        disableAll(true);
-        setStatus('Reading file...');
-        const base64 = await new Promise((resolve, reject) => {
+
+        const readFileAsBase64_ = (file) => new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onerror = () => reject(reader.error);
           reader.onload = () => {
@@ -1303,15 +1302,60 @@ function getChatSidebarHtml_() {
           reader.readAsDataURL(file);
         });
 
-        setStatus('Uploading file...');
-        google.script.run.withSuccessHandler(() => {
-          setStatus('File uploaded and indexed.');
-          try { refreshFiles_(); } catch (e) {}
+        const uploadOne_ = (file, base64) => new Promise((resolve, reject) => {
+          google.script.run
+            .withSuccessHandler((resp) => resolve(resp))
+            .withFailureHandler((err) => reject(err))
+            .uploadFileToKnowledge(
+              file.name,
+              file.type || 'application/octet-stream',
+              base64,
+              el('instructions').value,
+              Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked)
+            );
+        });
+
+        disableAll(true);
+
+        let uploaded = 0;
+        const failures = [];
+
+        try {
+          for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            const label = String(file && file.name ? file.name : 'file ' + String(i + 1));
+
+            try {
+              setStatus('Reading ' + label + ' (' + String(i + 1) + '/' + String(files.length) + ')...');
+              const base64 = await readFileAsBase64_(file);
+
+              setStatus('Uploading ' + label + ' (' + String(i + 1) + '/' + String(files.length) + ')...');
+              await uploadOne_(file, base64);
+              uploaded += 1;
+            } catch (err) {
+              const msg = err && err.message ? err.message : String(err);
+              failures.push(label + ': ' + msg);
+            }
+          }
+
+          try {
+            refreshFiles_();
+          } catch (e) {}
+
+          try {
+            if (el('fileInput')) el('fileInput').value = '';
+          } catch (e) {}
+
+          if (!failures.length) {
+            setStatus(uploaded === 1 ? '1 file uploaded and indexed.' : String(uploaded) + ' files uploaded and indexed.');
+          } else if (!uploaded) {
+            setStatus('No files uploaded. ' + failures[0]);
+          } else {
+            setStatus(String(uploaded) + ' uploaded, ' + String(failures.length) + ' failed. First error: ' + failures[0]);
+          }
+        } finally {
           disableAll(false);
-        }).withFailureHandler((err) => {
-          setStatus('Error uploading: ' + (err && err.message ? err.message : err));
-          disableAll(false);
-        }).uploadFileToKnowledge(file.name, file.type || 'application/octet-stream', base64, el('instructions').value, Boolean(el('replaceKnowledge') && el('replaceKnowledge').checked));
+        }
       });
 
       el('sendBtn').addEventListener('click', () => {
