@@ -291,11 +291,11 @@ function getChatSidebarHtml_() {
       </label>
     </div>
     <div class="row">
-      <label>Scope (file picker)</label>
+      <label>Scope (indexed items)</label>
       <select id="fileScope">
-        <option value="">All files</option>
+        <option value="">All indexed items</option>
       </select>
-      <div class="small">Pick a file to scope chat to it. If the file has no dedicated scope yet, the backend creates it on first use.</div>
+      <div class="small">Pick an indexed item to scope chat to it. Items are grouped by synced document, synced tabs, and uploads. If a dedicated scope does not exist yet, the backend creates it on first use.</div>
     </div>
 
     <div class="row">
@@ -1001,53 +1001,63 @@ function getChatSidebarHtml_() {
         if (!sel) return;
         const current = String(sel.value || '');
 
-        // Keep the first option (All files).
+        // Keep the first option (All indexed items).
         while (sel.options.length > 1) sel.remove(1);
 
         google.script.run
           .withSuccessHandler((resp) => {
             const files = Array.isArray(resp && resp.files) ? resp.files.slice() : [];
+            const scopeStatus_ = (f) => String(
+              (f && (f.fileScopeStatus || (f.hasFileScope ? 'ready' : 'lazy'))) || 'lazy'
+            ).toLowerCase();
+            const kindRank_ = (f) => {
+              const kind = String((f && f.kind) || '').toLowerCase();
+              if (kind === 'doc') return 0;
+              if (kind === 'tab') return 1;
+              if (kind === 'upload') return 2;
+              return 3;
+            };
+            const groupLabel_ = (kind) => {
+              if (kind === 'doc') return '──────── Full document ────────';
+              if (kind === 'tab') return '──────── Synced tabs ─────────';
+              if (kind === 'upload') return '──────── Uploads ─────────────';
+              return '──────── Other indexed items ─';
+            };
             const scopeRank = (f) => {
-              const status = String(
-                (f && (f.fileScopeStatus || (f.hasFileScope ? 'ready' : 'lazy'))) || 'lazy'
-              ).toLowerCase();
+              const status = scopeStatus_(f);
               return status === 'ready' ? 0 : 1;
             };
 
-            files.sort((a, b) => scopeRank(a) - scopeRank(b));
+            files.sort((a, b) => {
+              const kindDelta = kindRank_(a) - kindRank_(b);
+              if (kindDelta !== 0) return kindDelta;
+              const scopeDelta = scopeRank(a) - scopeRank(b);
+              if (scopeDelta !== 0) return scopeDelta;
+              const nameA = String((a && a.filename) || '').toLowerCase();
+              const nameB = String((b && b.filename) || '').toLowerCase();
+              return nameA.localeCompare(nameB);
+            });
 
-            let insertedReadyHeader = false;
-            let insertedLazyHeader = false;
+            let currentGroup = '';
 
             for (const f of files) {
               if (!f || f.id == null) continue;
-              const scopeStatus = String(
-                f.fileScopeStatus || (f.hasFileScope ? 'ready' : 'lazy')
-              ).toLowerCase();
+              const kind = String(f.kind || '').toLowerCase();
+              const scopeStatus = scopeStatus_(f);
 
-              if (scopeStatus === 'ready' && !insertedReadyHeader) {
+              if (kind !== currentGroup) {
                 const header = document.createElement('option');
-                header.value = '__header_ready__';
-                header.textContent = '──────── Ready scopes ────────';
+                header.value = '__header_' + kind + '__';
+                header.textContent = groupLabel_(kind);
                 header.disabled = true;
                 sel.appendChild(header);
-                insertedReadyHeader = true;
-              }
-
-              if (scopeStatus === 'lazy' && !insertedLazyHeader) {
-                const header = document.createElement('option');
-                header.value = '__header_lazy__';
-                header.textContent = '──────── On-demand scopes ─────';
-                header.disabled = true;
-                sel.appendChild(header);
-                insertedLazyHeader = true;
+                currentGroup = kind;
               }
 
               const opt = document.createElement('option');
               opt.value = String(f.id);
               const name = String(f.filename || '(unnamed)');
-              const kind = String(f.kind || '');
-              opt.textContent = (kind ? ('[' + kind + '] ') : '') + name;
+              opt.textContent = name;
               if (scopeStatus === 'lazy') {
                 opt.textContent += ' (scope created on first use)';
               } else if (scopeStatus === 'ready') {
