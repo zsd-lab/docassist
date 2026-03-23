@@ -522,6 +522,34 @@ function getChatSidebarHtml_() {
         el('status').textContent = text || '';
       }
 
+      function renderChatResponse_(resp, userText) {
+        const replyText = (resp && typeof resp.reply !== 'undefined') ? resp.reply : resp;
+        addMsg('Assistant', replyText || '(empty)');
+
+        if (resp && resp.generatedFiles && Array.isArray(resp.generatedFiles) && resp.generatedFiles.length) {
+          addGeneratedFiles_(resp.generatedFiles);
+        }
+
+        if (resp && resp.sources && Array.isArray(resp.sources) && resp.sources.length) {
+          addSources_(resp.sources);
+        }
+
+        if (el('autoAppend') && el('autoAppend').checked) {
+          try {
+            google.script.run
+              .withFailureHandler(() => { /* best-effort */ })
+              .appendChatTurnToDoc(userText, replyText || '');
+          } catch (e) {
+            // best-effort
+          }
+        }
+
+        try { loadChats_({ preferChatId: activeChatId }); } catch (e) {}
+
+        setStatus('Ready.');
+        disableAll(false);
+      }
+
       function getSelectedValues_(selectEl) {
         const sel = selectEl || null;
         if (!sel || !sel.options) return [];
@@ -1567,38 +1595,35 @@ function getChatSidebarHtml_() {
 
         const doSend = () => {
           const actuallySend_ = () => {
-            setStatus('Thinking...');
+            setStatus('Starting chat...');
             google.script.run.withSuccessHandler((resp) => {
-              const replyText = (resp && typeof resp.reply !== 'undefined') ? resp.reply : resp;
-              addMsg('Assistant', replyText || '(empty)');
-
-              if (resp && resp.generatedFiles && Array.isArray(resp.generatedFiles) && resp.generatedFiles.length) {
-                addGeneratedFiles_(resp.generatedFiles);
+              const jobId = resp && resp.jobId ? String(resp.jobId) : '';
+              if (!jobId) {
+                setStatus('Error: Missing chat job id.');
+                disableAll(false);
+                return;
               }
 
-              if (resp && resp.sources && Array.isArray(resp.sources) && resp.sources.length) {
-                addSources_(resp.sources);
-              }
-
-              if (el('autoAppend') && el('autoAppend').checked) {
-                try {
-                  google.script.run
-                    .withFailureHandler(() => { /* best-effort */ })
-                    .appendChatTurnToDoc(text, replyText || '');
-                } catch (e) {
-                  // best-effort
+              pollJobUntilDone_(jobId, 'Thinking', (err, jobResp) => {
+                if (err) {
+                  setStatus('Error: ' + (err && err.message ? err.message : err));
+                  disableAll(false);
+                  return;
                 }
-              }
 
-              // Refresh list so updated_at ordering matches.
-              try { loadChats_({ preferChatId: activeChatId }); } catch (e) {}
+                const result = jobResp && jobResp.result ? jobResp.result : null;
+                if (!result) {
+                  setStatus('Error: Chat finished without a result.');
+                  disableAll(false);
+                  return;
+                }
 
-              setStatus('Ready.');
-              disableAll(false);
+                renderChatResponse_(result, text);
+              });
             }).withFailureHandler((err) => {
-              setStatus('Error: ' + (err && err.message ? err.message : err));
+              setStatus('Error starting chat: ' + (err && err.message ? err.message : err));
               disableAll(false);
-            }).sendChatMessageInChat(text, el('instructions').value, el('fileScope') ? getSelectedValues_(el('fileScope')) : [], activeChatId || '');
+            }).startChatMessageInChat(text, el('instructions').value, el('fileScope') ? getSelectedValues_(el('fileScope')) : [], activeChatId || '');
           };
 
           if (activeChatId) {
@@ -1836,6 +1861,42 @@ function sendChatMessageInChat(userMessage, instructionsOverride, fileScopeIdOve
     userMessageLen: String(userMessage || '').length,
     instructionsLen: String(instructions || '').length,
     replyLen: resp && resp.reply ? String(resp.reply).length : 0,
+    ms: Date.now() - started
+  });
+
+  return resp;
+}
+
+function startChatMessageInChat(userMessage, instructionsOverride, fileScopeIdOverride, chatIdOverride) {
+  const started = Date.now();
+  const doc = DocumentApp.getActiveDocument();
+  const userId = getOrCreateUserId_();
+  const instructions = typeof instructionsOverride === 'string' ? instructionsOverride : getProjectInstructions_();
+
+  const userProps = PropertiesService.getUserProperties();
+  const activeChat = String(chatIdOverride || '').trim() || (userProps.getProperty('DOCASSIST_ACTIVE_CHAT_ID') || '');
+  if (!String(activeChat).trim()) throw new Error('No active chat. Create a new chat first.');
+
+  const storedFileScopeIds = getFileScopeIdsForThisDocument_();
+  const fileScopeIds = normalizeFileScopeIds_(
+    Array.isArray(fileScopeIdOverride) ? fileScopeIdOverride : (fileScopeIdOverride || storedFileScopeIds)
+  );
+
+  const resp = callBackendV2_('/v2/chats/' + encodeURIComponent(String(activeChat)) + '/send-async', {
+    userId: String(userId),
+    userMessage: String(userMessage || ''),
+    instructions: String(instructions || ''),
+    docId: doc.getId(),
+    fileIds: fileScopeIds,
+    fileId: fileScopeIds.length === 1 ? fileScopeIds[0] : ''
+  });
+
+  log_('v2.chat_thread.start', {
+    chatId: String(activeChat),
+    docId: doc.getId(),
+    userMessageLen: String(userMessage || '').length,
+    instructionsLen: String(instructions || '').length,
+    jobId: resp && resp.jobId ? String(resp.jobId) : '',
     ms: Date.now() - started
   });
 

@@ -2406,161 +2406,229 @@ c.) Coalition building through service
     }
   });
 
+  function parseThreadChatSendRequest_(req, res) {
+    if (!isPlainObject(req.body)) {
+      res.status(400).json(jsonError(req, "Invalid JSON body"));
+      return null;
+    }
+
+    const chatId = requireChatId_(req, res, req.params?.chatId);
+    if (chatId == null) return null;
+
+    const userId = requireUserId_(req, res, req.body.userId);
+    if (userId == null) return null;
+
+    const userMessage = requireNonEmptyTrimmedString(req, res, "userMessage", req.body.userMessage, {
+      maxChars: cfg.maxUserMessageChars,
+    });
+    if (userMessage == null) return null;
+
+    const instructions = typeof req.body.instructions === "undefined"
+      ? ""
+      : requireString(req, res, "instructions", req.body.instructions, {
+          maxChars: cfg.maxInstructionsChars,
+          allowEmpty: true,
+        });
+    if (instructions == null) return null;
+
+    const docId = typeof req.body.docId === "undefined"
+      ? ""
+      : requireString(req, res, "docId", req.body.docId, {
+          maxChars: cfg.maxDocIdChars,
+          allowEmpty: true,
+        });
+    if (docId == null) return null;
+
+    const fileId = typeof req.body.fileId === "undefined"
+      ? ""
+      : requireString(req, res, "fileId", req.body.fileId, {
+          maxChars: 64,
+          allowEmpty: true,
+        });
+    if (fileId == null) return null;
+
+    return {
+      chatId: String(chatId),
+      userId: String(userId),
+      userMessage: String(userMessage),
+      instructions: String(instructions || ""),
+      docId: String(docId || ""),
+      fileId: String(fileId || ""),
+      fileIds: Array.isArray(req.body.fileIds) ? req.body.fileIds : undefined,
+    };
+  }
+
+  async function executeThreadChatSend_(params) {
+    const started = Date.now();
+    const chatId = String(params?.chatId || "");
+    const userId = String(params?.userId || "");
+    const docId = String(params?.docId || "");
+    const instructions = String(params?.instructions || "");
+    const fileId = String(params?.fileId || "");
+    const fileIds = Array.isArray(params?.fileIds) ? params.fileIds : undefined;
+
+    const chat = await getChatThreadForUser_({ chatId, userId });
+    if (!chat) {
+      const err = new Error("Chat not found");
+      err.status = 404;
+      throw err;
+    }
+    if (chat.archived_at) {
+      const err = new Error("Chat is archived");
+      err.status = 400;
+      throw err;
+    }
+
+    const msgStr = String(params?.userMessage || "");
+
+    await appendChatMessage_({ chatId, role: "user", content: msgStr });
+    await maybeAutoTitleChat_({ chatId, existingTitle: chat.title, firstUserMessage: msgStr });
+
+    const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
+    if (askedModel) {
+      const replyText = `A backend szerint ezzel a modellel hívlak: ${cfg.openaiModel}`;
+      await appendChatMessage_({ chatId, role: "assistant", content: replyText });
+      return {
+        ok: true,
+        chatId,
+        reply: replyText,
+        responseId: "local-model-info",
+        sources: [],
+      };
+    }
+
+    let scopedVectorStoreIds = [];
+    let scopedFileIds = [];
+    let session = null;
+    let scopedDocsFiles = [];
+    let codeInterpreterFileIds = [];
+    if (String(docId || "").trim()) {
+      const resolved = await resolveScopedVectorStoresForDoc_({
+        docId,
+        fileIds: Array.isArray(fileIds) ? fileIds : String(fileId || "").trim(),
+      });
+      session = resolved.session;
+      scopedVectorStoreIds = Array.isArray(resolved.scopedVectorStoreIds) ? resolved.scopedVectorStoreIds : [];
+      scopedFileIds = Array.isArray(resolved.scopedFileIds) ? resolved.scopedFileIds : [];
+
+      if (scopedFileIds.length) {
+        const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScopes_({
+          docId,
+          fileIds: scopedFileIds,
+        });
+        scopedDocsFiles = codeInterpreterInputs.docsFiles;
+        codeInterpreterFileIds = codeInterpreterInputs.openaiFileIds;
+      }
+
+      if (typeof instructions === "string" && instructions.trim() !== String(session.instructions || "").trim()) {
+        session = await getOrCreateSession(docId, instructions);
+      }
+    }
+
+    const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFiles);
+    const tools = buildChatTools_({
+      vectorStoreIds: session
+        ? (scopedVectorStoreIds.length ? scopedVectorStoreIds : [session.vector_store_id])
+        : [],
+      enableCodeInterpreter,
+      codeInterpreterFileIds,
+    });
+    const response = await client.responses.create({
+      model: cfg.openaiModel,
+      conversation: String(chat.openai_conversation_id),
+      instructions: session
+        ? buildInstructions(session.instructions, session.doc_summary) +
+          (enableCodeInterpreter
+            ? "\n\nIf the user asks for a downloadable file, spreadsheet, CSV, or Excel workbook, use the python tool to create the file and mention that a downloadable attachment is available."
+            : "")
+        : SYSTEM_PROMPT,
+      tools,
+      include: enableCodeInterpreter ? ["code_interpreter_call.outputs"] : undefined,
+      input: msgStr,
+      max_output_tokens: cfg.maxOutputTokens,
+    });
+
+    const replyText = String(response.output_text || "").trim();
+    const generatedFiles = decorateGeneratedFilesForResponse_(extractGeneratedFilesFromResponse_(response));
+    await appendChatMessage_({
+      chatId,
+      role: "assistant",
+      content: replyText,
+      metadata: generatedFiles.length ? { generatedFiles } : null,
+    });
+
+    const usedSources = extractSourcesFromResponse_(response);
+    const sourceFileIds = usedSources.map((s) => s.fileId).filter(Boolean);
+    const fileMeta = session ? await resolveSourceMetadata_(docId, sourceFileIds) : new Map();
+    const sources = usedSources.map((s) => {
+      const meta = fileMeta.get(String(s.fileId)) || {};
+      const section = extractSectionFromQuote_(s.quote);
+      return {
+        fileId: s.fileId,
+        filename: meta.filename,
+        kind: meta.kind,
+        section,
+        snippet: clipSnippet(s.quote),
+      };
+    });
+
+    logChatEvent_({
+      chatId,
+      docId: String(docId || "") || null,
+      scope: scopedVectorStoreIds.length ? "file" : session ? "all" : "none",
+      fileId: scopedFileIds.length === 1 ? scopedFileIds[0] : null,
+      model: cfg.openaiModel,
+      usedSources: sources.length,
+      generatedFiles: generatedFiles.length,
+      usage: response?.usage || {},
+      latencyMs: Date.now() - started,
+    });
+
+    return {
+      ok: true,
+      chatId,
+      reply: replyText,
+      responseId: response.id,
+      sources,
+      generatedFiles,
+    };
+  }
+
   app.post("/v2/chats/:chatId/send", async (req, res) => {
     try {
-      const started = Date.now();
-      if (!isPlainObject(req.body)) {
-        return res.status(400).json(jsonError(req, "Invalid JSON body"));
-      }
+      const params = parseThreadChatSendRequest_(req, res);
+      if (!params) return;
+      const result = await executeThreadChatSend_(params);
+      return res.json(result);
+    } catch (err) {
+      logger.error(err);
+      const status = Number(err?.status) || 500;
+      return res.status(status).json(jsonError(req, err.message || "Server error"));
+    }
+  });
 
-      const chatId = requireChatId_(req, res, req.params?.chatId);
-      if (chatId == null) return;
+  app.post("/v2/chats/:chatId/send-async", async (req, res) => {
+    try {
+      const params = parseThreadChatSendRequest_(req, res);
+      if (!params) return;
 
-      const userId = requireUserId_(req, res, req.body.userId);
-      if (userId == null) return;
-
-      const userMessage = requireNonEmptyTrimmedString(req, res, "userMessage", req.body.userMessage, { maxChars: cfg.maxUserMessageChars });
-      if (userMessage == null) return;
-
-      const instructions = typeof req.body.instructions === "undefined" ? "" : requireString(req, res, "instructions", req.body.instructions, { maxChars: cfg.maxInstructionsChars, allowEmpty: true });
-      if (instructions == null) return;
-
-      const docId = typeof req.body.docId === "undefined" ? "" : requireString(req, res, "docId", req.body.docId, { maxChars: cfg.maxDocIdChars, allowEmpty: true });
-      if (docId == null) return;
-
-      const fileId = typeof req.body.fileId === "undefined"
-        ? ""
-        : requireString(req, res, "fileId", req.body.fileId, { maxChars: 64, allowEmpty: true });
-      if (fileId == null) return;
-      const fileIds = Array.isArray(req.body.fileIds) ? req.body.fileIds : undefined;
-
-      const chat = await getChatThreadForUser_({ chatId: String(chatId), userId: String(userId) });
-      if (!chat) {
-        return res.status(404).json(jsonError(req, "Chat not found"));
-      }
-      if (chat.archived_at) {
-        return res.status(400).json(jsonError(req, "Chat is archived"));
-      }
-
-      const msgStr = String(userMessage || "");
-
-      // Persist user message first.
-      await appendChatMessage_({ chatId: String(chatId), role: "user", content: msgStr });
-      await maybeAutoTitleChat_({ chatId: String(chatId), existingTitle: chat.title, firstUserMessage: msgStr });
-
-      const askedModel = /(\bmelyik\b|\bwhich\b).*(\bmodel\b|\bopenai\b)/i.test(msgStr);
-      if (askedModel) {
-        const replyText = `A backend szerint ezzel a modellel hívlak: ${cfg.openaiModel}`;
-        await appendChatMessage_({ chatId: String(chatId), role: "assistant", content: replyText });
-        return res.json({
-          ok: true,
-          chatId: String(chatId),
-          reply: replyText,
-          responseId: "local-model-info",
-          sources: [],
-        });
-      }
-
-      // Optional doc context: use doc vector store for retrieval and summary.
-      let scopedVectorStoreIds = [];
-      let scopedFileIds = [];
-      let session = null;
-      let scopedDocsFiles = [];
-      let codeInterpreterFileIds = [];
-      if (String(docId || "").trim()) {
-        const resolved = await resolveScopedVectorStoresForDoc_({
-          docId: String(docId),
-          fileIds: Array.isArray(fileIds) ? fileIds : String(fileId || "").trim(),
-        });
-        session = resolved.session;
-        scopedVectorStoreIds = Array.isArray(resolved.scopedVectorStoreIds) ? resolved.scopedVectorStoreIds : [];
-        scopedFileIds = Array.isArray(resolved.scopedFileIds) ? resolved.scopedFileIds : [];
-
-        if (scopedFileIds.length) {
-          const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScopes_({
-            docId: String(docId),
-            fileIds: scopedFileIds,
-          });
-          scopedDocsFiles = codeInterpreterInputs.docsFiles;
-          codeInterpreterFileIds = codeInterpreterInputs.openaiFileIds;
-        }
-
-        // Ensure session uses the requested instructions (updates docs_sessions if changed).
-        if (typeof instructions === "string" && instructions.trim() !== String(session.instructions || "").trim()) {
-          session = await getOrCreateSession(String(docId), String(instructions));
-        }
-      }
-
-      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFiles);
-      const tools = buildChatTools_({
-        vectorStoreIds: session
-          ? (scopedVectorStoreIds.length ? scopedVectorStoreIds : [session.vector_store_id])
-          : [],
-        enableCodeInterpreter,
-        codeInterpreterFileIds,
-      });
-      const response = await client.responses.create({
-        model: cfg.openaiModel,
-        conversation: String(chat.openai_conversation_id),
-        instructions: session
-          ? buildInstructions(session.instructions, session.doc_summary) +
-            (enableCodeInterpreter
-              ? "\n\nIf the user asks for a downloadable file, spreadsheet, CSV, or Excel workbook, use the python tool to create the file and mention that a downloadable attachment is available."
-              : "")
-          : SYSTEM_PROMPT,
-        tools,
-        include: enableCodeInterpreter ? ["code_interpreter_call.outputs"] : undefined,
-        input: msgStr,
-        max_output_tokens: cfg.maxOutputTokens,
+      const job = createJob_("chat-send", {
+        chatId: params.chatId,
+        userId: params.userId,
+        docId: params.docId,
       });
 
-      const replyText = String(response.output_text || "").trim();
-      const generatedFiles = decorateGeneratedFilesForResponse_(extractGeneratedFilesFromResponse_(response));
-      await appendChatMessage_({
-        chatId: String(chatId),
-        role: "assistant",
-        content: replyText,
-        metadata: generatedFiles.length ? { generatedFiles } : null,
-      });
-
-      const usedSources = extractSourcesFromResponse_(response);
-      const sourceFileIds = usedSources.map((s) => s.fileId).filter(Boolean);
-      const fileMeta = session ? await resolveSourceMetadata_(String(docId), sourceFileIds) : new Map();
-      const sources = usedSources.map((s) => {
-        const meta = fileMeta.get(String(s.fileId)) || {};
-        const section = extractSectionFromQuote_(s.quote);
-        return {
-          fileId: s.fileId,
-          filename: meta.filename,
-          kind: meta.kind,
-          section,
-          snippet: clipSnippet(s.quote),
-        };
-      });
-
-      logChatEvent_({
-        chatId: String(chatId),
-        docId: String(docId || "") || null,
-        scope: scopedVectorStoreIds.length ? "file" : session ? "all" : "none",
-        fileId: scopedFileIds.length === 1 ? scopedFileIds[0] : null,
-        model: cfg.openaiModel,
-        usedSources: sources.length,
-        generatedFiles: generatedFiles.length,
-        usage: response?.usage || {},
-        latencyMs: Date.now() - started,
-      });
+      runJob_(job.id, async () => executeThreadChatSend_(params));
 
       return res.json({
         ok: true,
-        chatId: String(chatId),
-        reply: replyText,
-        responseId: response.id,
-        sources,
-        generatedFiles,
+        jobId: job.id,
+        status: job.status,
       });
     } catch (err) {
       logger.error(err);
-      return res.status(500).json(jsonError(req, err.message || "Server error"));
+      const status = Number(err?.status) || 500;
+      return res.status(status).json(jsonError(req, err.message || "Server error"));
     }
   });
 

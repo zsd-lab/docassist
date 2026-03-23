@@ -323,6 +323,76 @@ test("POST /v2/chats/:chatId/send persists generated file metadata", async () =>
   });
 });
 
+test("POST /v2/chats/:chatId/send-async returns a job and exposes the final result", async () => {
+  const insertedMessages = [];
+  const openaiClient = {
+    responses: {
+      async create() {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { id: "r_async", output_text: "Async hello" };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("FROM chats") && q.includes("WHERE id = $1 AND user_id = $2")) {
+          return {
+            rows: [
+              {
+                id: "chat1",
+                user_id: "user1",
+                title: "New chat",
+                openai_conversation_id: "conv1",
+                archived_at: null,
+                created_at: "2025-01-01T00:00:00.000Z",
+                updated_at: "2025-01-01T00:00:00.000Z",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (q.includes("INSERT INTO chat_messages")) {
+          insertedMessages.push(params);
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("UPDATE chats SET title = $2") || q.includes("UPDATE chats SET updated_at = NOW()")) {
+          return { rows: [], rowCount: 1 };
+        }
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const startRes = await request(app)
+    .post("/v2/chats/chat1/send-async")
+    .send({ userId: "user1", userMessage: "Hello async" });
+
+  assert.equal(startRes.status, 200);
+  assert.ok(startRes.body.jobId);
+
+  let finalJob = null;
+  for (let i = 0; i < 30; i++) {
+    const jr = await request(app).get(`/v2/jobs/${startRes.body.jobId}`);
+    assert.equal(jr.status, 200);
+    if (jr.body.status === "succeeded") {
+      finalJob = jr.body;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.ok(finalJob);
+  assert.equal(finalJob.result.reply, "Async hello");
+  assert.equal(insertedMessages.length, 2);
+  assert.equal(insertedMessages[0][1], "user");
+  assert.equal(insertedMessages[1][1], "assistant");
+});
+
 test("GET /v2/chats/:chatId/messages returns generated files from metadata", async () => {
   const { app } = createApp({
     pool: makePoolMock({
