@@ -718,6 +718,201 @@ test("POST /v2/chat with fileId lazily materializes file-scoped vector store", a
   assert.equal(updates.length, 3);
 });
 
+test("POST /v2/chat with multiple fileIds searches across selected scopes", async () => {
+  const openaiCalls = [];
+  const openaiClient = {
+    responses: {
+      async create(payload) {
+        openaiCalls.push(payload);
+        return { id: "r_multi", output_text: "Multi scoped" };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      sessionRow: {
+        doc_id: "doc1",
+        conversation_id: "c1",
+        vector_store_id: "vs_doc",
+        instructions: "",
+        model: "test-model",
+      },
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("FROM docs_files") && q.includes("WHERE doc_id = $1 AND id = $2")) {
+          if (params[1] === 12) {
+            return {
+              rows: [
+                {
+                  id: 12,
+                  doc_id: "doc1",
+                  kind: "upload",
+                  filename: "budget.csv",
+                  sha256: "h12",
+                  vector_store_file_id: "vsf_doc_12",
+                  file_vector_store_id: "vs_file_12",
+                  file_vector_store_file_id: "vsf_file_12",
+                  vector_store_file_file_id: "file_upload_12",
+                  file_vector_store_file_file_id: "file_upload_12",
+                  source_parent_kind: null,
+                  source_parent_sha256: null,
+                },
+              ],
+              rowCount: 1,
+            };
+          }
+          if (params[1] === 13) {
+            return {
+              rows: [
+                {
+                  id: 13,
+                  doc_id: "doc1",
+                  kind: "tab",
+                  filename: "tab_Overview.txt",
+                  sha256: "h13",
+                  vector_store_file_id: "vsf_doc_13",
+                  file_vector_store_id: "vs_file_13",
+                  file_vector_store_file_id: "vsf_file_13",
+                  vector_store_file_file_id: "file_tab_13",
+                  file_vector_store_file_file_id: "file_tab_13",
+                  source_parent_kind: null,
+                  source_parent_sha256: null,
+                },
+              ],
+              rowCount: 1,
+            };
+          }
+        }
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chat")
+    .send({ docId: "doc1", userMessage: "Create an Excel summary from these selected files.", fileIds: [12, 13] });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reply, "Multi scoped");
+  assert.deepEqual(res.body.scope, { type: "file", fileIds: [12, 13] });
+  assert.equal(openaiCalls.length, 1);
+  assert.deepEqual(openaiCalls[0].tools[0].vector_store_ids, ["vs_file_12", "vs_file_13"]);
+  assert.deepEqual(openaiCalls[0].tools[1].container.file_ids, ["file_upload_12"]);
+});
+
+test("POST /v2/chats/:chatId/send with multiple fileIds searches selected scopes", async () => {
+  const openaiCalls = [];
+  const openaiClient = {
+    responses: {
+      async create(payload) {
+        openaiCalls.push(payload);
+        return { id: "r_chat_multi", output_text: "Thread multi scoped" };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      queryHandler: async (sql, params) => {
+        const q = String(sql);
+        if (q.includes("FROM chats") && q.includes("WHERE id = $1 AND user_id = $2")) {
+          return {
+            rows: [
+              {
+                id: "chat1",
+                user_id: "user1",
+                title: "New chat",
+                openai_conversation_id: "conv1",
+                archived_at: null,
+                created_at: "2025-01-01T00:00:00.000Z",
+                updated_at: "2025-01-01T00:00:00.000Z",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (q.includes("SELECT doc_id, conversation_id")) {
+          return {
+            rows: [
+              {
+                doc_id: "doc1",
+                conversation_id: "c1",
+                vector_store_id: "vs_doc",
+                instructions: "",
+                model: "test-model",
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (q.includes("INSERT INTO chat_messages") || q.includes("UPDATE chats SET updated_at = NOW()") || q.includes("UPDATE chats SET title = $2")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (q.includes("FROM docs_files") && q.includes("WHERE doc_id = $1 AND id = $2")) {
+          if (params[1] === 12) {
+            return {
+              rows: [
+                {
+                  id: 12,
+                  doc_id: "doc1",
+                  kind: "upload",
+                  filename: "budget.csv",
+                  sha256: "h12",
+                  vector_store_file_id: "vsf_doc_12",
+                  file_vector_store_id: "vs_file_12",
+                  file_vector_store_file_id: "vsf_file_12",
+                  vector_store_file_file_id: "file_upload_12",
+                  file_vector_store_file_file_id: "file_upload_12",
+                  source_parent_kind: null,
+                  source_parent_sha256: null,
+                },
+              ],
+              rowCount: 1,
+            };
+          }
+          if (params[1] === 13) {
+            return {
+              rows: [
+                {
+                  id: 13,
+                  doc_id: "doc1",
+                  kind: "tab",
+                  filename: "tab_Overview.txt",
+                  sha256: "h13",
+                  vector_store_file_id: "vsf_doc_13",
+                  file_vector_store_id: "vs_file_13",
+                  file_vector_store_file_id: "vsf_file_13",
+                  vector_store_file_file_id: "file_tab_13",
+                  file_vector_store_file_file_id: "file_tab_13",
+                  source_parent_kind: null,
+                  source_parent_sha256: null,
+                },
+              ],
+              rowCount: 1,
+            };
+          }
+        }
+        return null;
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chats/chat1/send")
+    .send({ userId: "user1", docId: "doc1", userMessage: "Create an Excel summary from these selected files.", fileIds: [12, 13] });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.reply, "Thread multi scoped");
+  assert.equal(openaiCalls.length, 1);
+  assert.deepEqual(openaiCalls[0].tools[0].vector_store_ids, ["vs_file_12", "vs_file_13"]);
+  assert.deepEqual(openaiCalls[0].tools[1].container.file_ids, ["file_upload_12"]);
+});
+
 test("POST /v2/reset-doc missing docId -> 400", async () => {
   const { app } = createApp({
     pool: makePoolMock(),

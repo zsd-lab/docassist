@@ -619,8 +619,13 @@ c.) Coalition building through service
     return /\.(xlsx|xls|csv|tsv|ods)$/i.test(name);
   }
 
-  function shouldEnableCodeInterpreter_(msg, scopedDocsFile) {
-    if (scopedDocsFile && String(scopedDocsFile.kind || "") === "upload") return true;
+  function shouldEnableCodeInterpreter_(msg, scopedDocsFiles) {
+    const list = Array.isArray(scopedDocsFiles)
+      ? scopedDocsFiles
+      : scopedDocsFiles
+        ? [scopedDocsFiles]
+        : [];
+    if (list.some((file) => file && String(file.kind || "") === "upload")) return true;
     const s = String(msg || "");
     if (!s.trim()) return false;
     return /(excel|xlsx|xls|csv|tsv|spreadsheet|workbook|sheet\b|downloadable file|download link|generate file|create file|export)/i.test(s);
@@ -1060,33 +1065,77 @@ c.) Coalition building through service
     await pool.query(`UPDATE chats SET updated_at = NOW() WHERE id = $1`, [String(chatId)]);
   }
 
-  async function resolveCodeInterpreterInputFilesForScope_({ docId, fileId }) {
-    if (!docId || !fileId) return { docsFile: null, openaiFileIds: [] };
+  function normalizeSelectedFileIds_(value) {
+    let rawValues = [];
 
-    const scopedDocsFile = await getDocsFileById_(pool, {
-      docId: String(docId),
-      docsFileId: Number(fileId),
-    });
-    if (!scopedDocsFile) return { docsFile: null, openaiFileIds: [] };
-
-    const openaiFileId = String(scopedDocsFile.vector_store_file_file_id || "").trim();
-    if (String(scopedDocsFile.kind || "") !== "upload" || !openaiFileId) {
-      return { docsFile: scopedDocsFile, openaiFileIds: [] };
+    if (Array.isArray(value)) {
+      rawValues = value;
+    } else if (value != null) {
+      const raw = String(value).trim();
+      if (!raw) return [];
+      if (raw.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) rawValues = parsed;
+          else rawValues = [parsed];
+        } catch (_) {
+          rawValues = raw.split(",");
+        }
+      } else {
+        rawValues = raw.split(",");
+      }
     }
 
-    return {
-      docsFile: scopedDocsFile,
-      openaiFileIds: [openaiFileId],
-    };
+    const out = [];
+    const seen = new Set();
+    for (const entry of rawValues) {
+      const n = Number.parseInt(String(entry ?? "").trim(), 10);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      if (seen.has(n)) continue;
+      seen.add(n);
+      out.push(n);
+    }
+    return out;
   }
 
-  function buildChatTools_({ vectorStoreId, enableCodeInterpreter, codeInterpreterFileIds }) {
-    const tools = [];
+  async function resolveCodeInterpreterInputFilesForScopes_({ docId, fileIds }) {
+    const normalized = normalizeSelectedFileIds_(fileIds);
+    if (!docId || !normalized.length) return { docsFiles: [], openaiFileIds: [] };
 
-    if (vectorStoreId) {
+    const docsFiles = [];
+    const openaiFileIds = [];
+    const seenOpenAIFileIds = new Set();
+
+    for (const fileId of normalized) {
+      const scopedDocsFile = await getDocsFileById_(pool, {
+        docId: String(docId),
+        docsFileId: Number(fileId),
+      });
+      if (!scopedDocsFile) continue;
+      docsFiles.push(scopedDocsFile);
+
+      const openaiFileId = String(scopedDocsFile.vector_store_file_file_id || "").trim();
+      if (String(scopedDocsFile.kind || "") !== "upload" || !openaiFileId) continue;
+      if (seenOpenAIFileIds.has(openaiFileId)) continue;
+      seenOpenAIFileIds.add(openaiFileId);
+      openaiFileIds.push(openaiFileId);
+    }
+
+    return { docsFiles, openaiFileIds };
+  }
+
+  function buildChatTools_({ vectorStoreIds, enableCodeInterpreter, codeInterpreterFileIds }) {
+    const tools = [];
+    const searchIds = Array.isArray(vectorStoreIds)
+      ? Array.from(new Set(vectorStoreIds.filter(Boolean).map((value) => String(value))))
+      : vectorStoreIds
+        ? [String(vectorStoreIds)]
+        : [];
+
+    if (searchIds.length) {
       tools.push({
         type: "file_search",
-        vector_store_ids: [String(vectorStoreId)],
+        vector_store_ids: searchIds,
       });
     }
 
@@ -1139,6 +1188,53 @@ c.) Coalition building through service
     } catch (_) {
       return { session, scopedVectorStoreId: null, scopedFileId: null };
     }
+  }
+
+  async function resolveScopedVectorStoresForDoc_({ docId, fileIds }) {
+    if (!docId) {
+      return {
+        session: null,
+        scopedVectorStoreIds: [],
+        scopedFileIds: [],
+      };
+    }
+
+    const session = await getOrCreateSession(String(docId), "");
+    const normalizedFileIds = normalizeSelectedFileIds_(fileIds);
+    if (!normalizedFileIds.length) {
+      return {
+        session,
+        scopedVectorStoreIds: [],
+        scopedFileIds: [],
+      };
+    }
+
+    const scopedVectorStoreIds = [];
+    const scopedFileIds = [];
+    const seenVectorStoreIds = new Set();
+
+    for (const scopedFileId of normalizedFileIds) {
+      try {
+        const materialized = await materializeFileScopeForDocsFile_({
+          docId: String(docId),
+          docsFileId: scopedFileId,
+        });
+        const vectorStoreId = String(materialized?.scopedVectorStoreId || "").trim();
+        if (!vectorStoreId) continue;
+        scopedFileIds.push(scopedFileId);
+        if (seenVectorStoreIds.has(vectorStoreId)) continue;
+        seenVectorStoreIds.add(vectorStoreId);
+        scopedVectorStoreIds.push(vectorStoreId);
+      } catch (_) {
+        // best-effort: skip invalid/unmaterializable selected ids
+      }
+    }
+
+    return {
+      session,
+      scopedVectorStoreIds,
+      scopedFileIds,
+    };
   }
 
   async function getDocsFileById_(db, { docId, docsFileId }) {
@@ -2332,8 +2428,11 @@ c.) Coalition building through service
       const docId = typeof req.body.docId === "undefined" ? "" : requireString(req, res, "docId", req.body.docId, { maxChars: cfg.maxDocIdChars, allowEmpty: true });
       if (docId == null) return;
 
-      const fileId = typeof req.body.fileId === "undefined" ? "" : requireString(req, res, "fileId", req.body.fileId, { maxChars: 64, allowEmpty: true });
+      const fileId = typeof req.body.fileId === "undefined"
+        ? ""
+        : requireString(req, res, "fileId", req.body.fileId, { maxChars: 64, allowEmpty: true });
       if (fileId == null) return;
+      const fileIds = Array.isArray(req.body.fileIds) ? req.body.fileIds : undefined;
 
       const chat = await getChatThreadForUser_({ chatId: String(chatId), userId: String(userId) });
       if (!chat) {
@@ -2363,23 +2462,26 @@ c.) Coalition building through service
       }
 
       // Optional doc context: use doc vector store for retrieval and summary.
-      let scopedVectorStoreId = null;
-      let scopedFileId = null;
+      let scopedVectorStoreIds = [];
+      let scopedFileIds = [];
       let session = null;
-      let scopedDocsFile = null;
+      let scopedDocsFiles = [];
       let codeInterpreterFileIds = [];
       if (String(docId || "").trim()) {
-        const resolved = await resolveScopedVectorStoreIdForDoc_({ docId: String(docId), fileId: String(fileId || "").trim() });
+        const resolved = await resolveScopedVectorStoresForDoc_({
+          docId: String(docId),
+          fileIds: Array.isArray(fileIds) ? fileIds : String(fileId || "").trim(),
+        });
         session = resolved.session;
-        scopedVectorStoreId = resolved.scopedVectorStoreId;
-        scopedFileId = resolved.scopedFileId;
+        scopedVectorStoreIds = Array.isArray(resolved.scopedVectorStoreIds) ? resolved.scopedVectorStoreIds : [];
+        scopedFileIds = Array.isArray(resolved.scopedFileIds) ? resolved.scopedFileIds : [];
 
-        if (scopedFileId) {
-          const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScope_({
+        if (scopedFileIds.length) {
+          const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScopes_({
             docId: String(docId),
-            fileId: scopedFileId,
+            fileIds: scopedFileIds,
           });
-          scopedDocsFile = codeInterpreterInputs.docsFile;
+          scopedDocsFiles = codeInterpreterInputs.docsFiles;
           codeInterpreterFileIds = codeInterpreterInputs.openaiFileIds;
         }
 
@@ -2389,9 +2491,11 @@ c.) Coalition building through service
         }
       }
 
-      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFile);
+      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFiles);
       const tools = buildChatTools_({
-        vectorStoreId: session ? scopedVectorStoreId || session.vector_store_id : null,
+        vectorStoreIds: session
+          ? (scopedVectorStoreIds.length ? scopedVectorStoreIds : [session.vector_store_id])
+          : [],
         enableCodeInterpreter,
         codeInterpreterFileIds,
       });
@@ -2437,8 +2541,8 @@ c.) Coalition building through service
       logChatEvent_({
         chatId: String(chatId),
         docId: String(docId || "") || null,
-        scope: scopedVectorStoreId ? "file" : session ? "all" : "none",
-        fileId: scopedFileId || null,
+        scope: scopedVectorStoreIds.length ? "file" : session ? "all" : "none",
+        fileId: scopedFileIds.length === 1 ? scopedFileIds[0] : null,
         model: cfg.openaiModel,
         usedSources: sources.length,
         generatedFiles: generatedFiles.length,
@@ -3338,21 +3442,26 @@ c.) Coalition building through service
         typeof instructions === "string" ? instructions : ""
       );
 
-      let scopedVectorStoreId = null;
-      let scopedFileId = null;
-      let scopedDocsFile = null;
+      let scopedVectorStoreIds = [];
+      let scopedFileIds = [];
+      let scopedDocsFiles = [];
       let codeInterpreterFileIds = [];
-      if (req.body.fileId != null && String(req.body.fileId).trim() !== "") {
+      const requestedScopeIds = Array.isArray(req.body.fileIds)
+        ? req.body.fileIds
+        : req.body.fileId != null
+          ? String(req.body.fileId)
+          : [];
+      if (Array.isArray(requestedScopeIds) ? requestedScopeIds.length : String(requestedScopeIds).trim() !== "") {
         try {
-          const resolved = await resolveScopedVectorStoreIdForDoc_({
+          const resolved = await resolveScopedVectorStoresForDoc_({
             docId: String(docId),
-            fileId: String(req.body.fileId),
+            fileIds: requestedScopeIds,
           });
-          scopedVectorStoreId = resolved?.scopedVectorStoreId || null;
-          scopedFileId = resolved?.scopedFileId || null;
+          scopedVectorStoreIds = Array.isArray(resolved?.scopedVectorStoreIds) ? resolved.scopedVectorStoreIds : [];
+          scopedFileIds = Array.isArray(resolved?.scopedFileIds) ? resolved.scopedFileIds : [];
         } catch (_) {
-          scopedVectorStoreId = null;
-          scopedFileId = null;
+          scopedVectorStoreIds = [];
+          scopedFileIds = [];
         }
       }
 
@@ -3368,18 +3477,18 @@ c.) Coalition building through service
       }
 
       const forceSearch = cfg.forceFileSearch && shouldForceFileSearch(msgStr);
-      if (scopedFileId) {
-        const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScope_({
+      if (scopedFileIds.length) {
+        const codeInterpreterInputs = await resolveCodeInterpreterInputFilesForScopes_({
           docId: String(docId),
-          fileId: scopedFileId,
+          fileIds: scopedFileIds,
         });
-        scopedDocsFile = codeInterpreterInputs.docsFile;
+        scopedDocsFiles = codeInterpreterInputs.docsFiles;
         codeInterpreterFileIds = codeInterpreterInputs.openaiFileIds;
       }
 
-      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFile);
+      const enableCodeInterpreter = shouldEnableCodeInterpreter_(msgStr, scopedDocsFiles);
       const tools = buildChatTools_({
-        vectorStoreId: scopedVectorStoreId || session.vector_store_id,
+        vectorStoreIds: scopedVectorStoreIds.length ? scopedVectorStoreIds : [session.vector_store_id],
         enableCodeInterpreter,
         codeInterpreterFileIds,
       });
@@ -3416,7 +3525,7 @@ c.) Coalition building through service
           tools: [
             {
               type: "file_search",
-              vector_store_ids: [scopedVectorStoreId || session.vector_store_id],
+              vector_store_ids: scopedVectorStoreIds.length ? scopedVectorStoreIds : [session.vector_store_id],
             },
           ],
           tool_choice: { type: "file_search" },
@@ -3463,8 +3572,8 @@ c.) Coalition building through service
       const usage = response?.usage || {};
       logChatEvent_({
         docId: String(docId),
-        scope: scopedVectorStoreId ? "file" : "all",
-        fileId: scopedFileId || null,
+        scope: scopedVectorStoreIds.length ? "file" : "all",
+        fileId: scopedFileIds.length === 1 ? scopedFileIds[0] : null,
         model: session.model || cfg.openaiModel,
         forceSearch: Boolean(forceSearch),
         twoStep: Boolean(cfg.twoStepEnabled && isComplexPrompt(msgStr)),
@@ -3479,9 +3588,11 @@ c.) Coalition building through service
         responseId: response.id,
         sources,
         generatedFiles,
-        scope: scopedVectorStoreId
-          ? { type: "file", fileId: scopedFileId }
-          : { type: "all" },
+        scope: scopedFileIds.length > 1
+          ? { type: "file", fileIds: scopedFileIds }
+          : scopedFileIds.length === 1
+            ? { type: "file", fileId: scopedFileIds[0] }
+            : { type: "all" },
       });
     } catch (err) {
       logger.error(err);

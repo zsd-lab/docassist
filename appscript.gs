@@ -219,6 +219,33 @@ function getChatSidebarHtml_() {
       .chat pre code { white-space: pre; }
       .generated-files { margin: 6px 0 10px 0; padding-left: 18px; }
       .generated-files .file-link { margin-right: 8px; }
+      .scope-summary { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; min-height: 22px; }
+      .scope-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 8px;
+        border: 1px solid #dadce0;
+        border-radius: 999px;
+        background: #f1f3f4;
+        font-size: 12px;
+        color: #202124;
+      }
+      .scope-chip button {
+        padding: 0;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        color: #5f6368;
+      }
+      .scope-chip button:disabled { cursor: not-allowed; }
+      .scope-summary-empty {
+        font-size: 12px;
+        color: #5f6368;
+        padding: 4px 0;
+      }
     </style>
   </head>
   <body>
@@ -294,10 +321,14 @@ function getChatSidebarHtml_() {
     </div>
     <div class="row">
       <label>Scope (indexed items)</label>
-      <select id="fileScope">
+      <select id="fileScope" multiple size="8">
         <option value="">All indexed items</option>
       </select>
-      <div class="small">Pick an indexed item to scope chat to it. Items are grouped by synced document, synced tabs, and uploads. If a dedicated scope does not exist yet, the backend creates it on first use.</div>
+      <div id="fileScopeSummary" class="scope-summary"></div>
+      <div class="controls" style="margin-top:6px;">
+        <button id="clearFileScopeBtn" type="button">Clear scope selection</button>
+      </div>
+      <div class="small">Pick one or more indexed items to scope chat to them. Use Cmd/Ctrl-click or Shift-click for multiple selection. Items are grouped by synced document, synced tabs, and uploads. If a dedicated scope does not exist yet, the backend creates it on first use.</div>
     </div>
 
     <div class="row">
@@ -372,6 +403,7 @@ function getChatSidebarHtml_() {
       let chatThreads = [];
       let activeChatId = null;
       let activeChatTitle = '';
+      let pendingFileScopeIds = [];
 
       function escapeHtml(s) {
         return String(s || '')
@@ -488,6 +520,70 @@ function getChatSidebarHtml_() {
 
       function setStatus(text) {
         el('status').textContent = text || '';
+      }
+
+      function getSelectedValues_(selectEl) {
+        const sel = selectEl || null;
+        if (!sel || !sel.options) return [];
+        return Array.from(sel.options)
+          .filter((opt) => opt && opt.selected && !opt.disabled && String(opt.value || '') !== '')
+          .map((opt) => String(opt.value));
+      }
+
+      function setSelectedValues_(selectEl, values) {
+        const sel = selectEl || null;
+        if (!sel || !sel.options) return;
+        const wanted = new Set((Array.isArray(values) ? values : []).map((v) => String(v)));
+        Array.from(sel.options).forEach((opt) => {
+          if (!opt || opt.disabled) return;
+          opt.selected = wanted.has(String(opt.value || ''));
+        });
+      }
+
+      function renderSelectedScopes_() {
+        const summaryEl = el('fileScopeSummary');
+        const selectEl = el('fileScope');
+        if (!summaryEl || !selectEl) return;
+
+        summaryEl.innerHTML = '';
+
+        const selected = Array.from(selectEl.options)
+          .filter((opt) => opt && opt.selected && !opt.disabled && String(opt.value || '') !== '')
+          .map((opt) => ({ value: String(opt.value), label: String(opt.textContent || opt.label || opt.value) }));
+
+        if (!selected.length) {
+          const empty = document.createElement('div');
+          empty.className = 'scope-summary-empty';
+          empty.textContent = 'Using all indexed items.';
+          summaryEl.appendChild(empty);
+          return;
+        }
+
+        selected.forEach((item) => {
+          const chip = document.createElement('div');
+          chip.className = 'scope-chip';
+
+          const text = document.createElement('span');
+          text.textContent = item.label;
+
+          const removeBtn = document.createElement('button');
+          removeBtn.type = 'button';
+          removeBtn.title = 'Remove ' + item.label;
+          removeBtn.setAttribute('aria-label', 'Remove ' + item.label);
+          removeBtn.textContent = '×';
+          removeBtn.addEventListener('click', () => {
+            const next = getSelectedValues_(selectEl).filter((value) => value !== item.value);
+            setSelectedValues_(selectEl, next);
+            pendingFileScopeIds = next.slice();
+            setFileScope_(next);
+            renderSelectedScopes_();
+            setStatus(next.length ? 'Updated scope selection.' : 'Scope selection cleared.');
+          });
+
+          chip.appendChild(text);
+          chip.appendChild(removeBtn);
+          summaryEl.appendChild(chip);
+        });
       }
 
       function pollJobUntilDone_(jobId, label, onDone) {
@@ -871,7 +967,7 @@ function getChatSidebarHtml_() {
       }
 
       function disableAll(disabled) {
-        ['saveSettingsBtn','resetServerBtn','cleanupOpenaiBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope','newChatBtn','renameChatBtn','archiveChatBtn'].forEach(id => {
+        ['saveSettingsBtn','resetServerBtn','cleanupOpenaiBtn','syncBtn','syncAllBtn','saveInstrBtn','uploadBtn','sendBtn','copyLastBtn','insertMdBtn','fileScope','clearFileScopeBtn','newChatBtn','renameChatBtn','archiveChatBtn'].forEach(id => {
           try { el(id).disabled = disabled; } catch (e) {}
         });
 
@@ -1050,9 +1146,11 @@ function getChatSidebarHtml_() {
           el('baseUrl').value = state.baseUrl || '';
           el('token').value = state.token || '';
           el('instructions').value = state.instructions || '';
+          pendingFileScopeIds = Array.isArray(state.fileScopeIds) ? state.fileScopeIds.map((v) => String(v)) : [];
           try { setActiveChatUi_(state.activeChatId || '', ''); } catch (e) {}
           try { if (el('autoAppend')) el('autoAppend').checked = true; } catch (e) {}
-          try { if (el('fileScope')) el('fileScope').value = (state.fileScopeId != null ? String(state.fileScopeId) : ''); } catch (e) {}
+          try { if (el('fileScope')) setSelectedValues_(el('fileScope'), pendingFileScopeIds); } catch (e) {}
+          try { renderSelectedScopes_(); } catch (e) {}
           try { if (el('tabPicker')) el('tabPicker').value = (state.selectedTabId != null ? String(state.selectedTabId) : ''); } catch (e) {}
           if (settingsEl) settingsEl.open = !state.baseUrl;
           setStatus(state.baseUrl ? 'Ready.' : 'Set Backend URL first (open Connection settings).');
@@ -1068,10 +1166,10 @@ function getChatSidebarHtml_() {
         }).getSidebarState();
       }
 
-      function setFileScope_(fileId) {
+      function setFileScope_(fileIds) {
         google.script.run
           .withFailureHandler(() => { /* best-effort */ })
-          .setFileScopeIdForThisDocument(fileId);
+          .setFileScopeIdsForThisDocument(Array.isArray(fileIds) ? fileIds : []);
       }
 
       function setTabSelection_(tabId) {
@@ -1083,7 +1181,7 @@ function getChatSidebarHtml_() {
       function refreshFiles_() {
         const sel = el('fileScope');
         if (!sel) return;
-        const current = String(sel.value || '');
+        const current = pendingFileScopeIds.length ? pendingFileScopeIds.slice() : getSelectedValues_(sel);
 
         // Keep the first option (All indexed items).
         while (sel.options.length > 1) sel.remove(1);
@@ -1150,10 +1248,13 @@ function getChatSidebarHtml_() {
               sel.appendChild(opt);
             }
 
-            // Restore selection if still present.
-            const maybe = Array.from(sel.options).some(o => o.value === current);
-            sel.value = maybe ? current : '';
-            setFileScope_(sel.value);
+            // Restore selections that still exist.
+            const available = new Set(Array.from(sel.options).map((o) => String(o.value || '')));
+            const restored = current.filter((value) => available.has(String(value)));
+            setSelectedValues_(sel, restored);
+            pendingFileScopeIds = restored.slice();
+            setFileScope_(restored);
+            renderSelectedScopes_();
           })
           .withFailureHandler((err) => {
             setStatus('Failed to load files: ' + (err && err.message ? err.message : err));
@@ -1162,7 +1263,22 @@ function getChatSidebarHtml_() {
       }
 
       el('fileScope').addEventListener('change', () => {
-        try { setFileScope_(el('fileScope').value); } catch (e) {}
+        try {
+          const values = getSelectedValues_(el('fileScope'));
+          pendingFileScopeIds = values.slice();
+          setFileScope_(values);
+          renderSelectedScopes_();
+        } catch (e) {}
+      });
+
+      el('clearFileScopeBtn').addEventListener('click', () => {
+        try {
+          setSelectedValues_(el('fileScope'), []);
+          pendingFileScopeIds = [];
+          setFileScope_([]);
+          renderSelectedScopes_();
+          setStatus('Scope selection cleared.');
+        } catch (e) {}
       });
 
       function refreshTabs_() {
@@ -1482,7 +1598,7 @@ function getChatSidebarHtml_() {
             }).withFailureHandler((err) => {
               setStatus('Error: ' + (err && err.message ? err.message : err));
               disableAll(false);
-            }).sendChatMessageInChat(text, el('instructions').value, el('fileScope') ? el('fileScope').value : '', activeChatId || '');
+            }).sendChatMessageInChat(text, el('instructions').value, el('fileScope') ? getSelectedValues_(el('fileScope')) : [], activeChatId || '');
           };
 
           if (activeChatId) {
@@ -1556,7 +1672,7 @@ function getSidebarState() {
   const token = props.getProperty('DOCASSIST_TOKEN') || '';
   const docProps = PropertiesService.getDocumentProperties();
   const instructions = docProps.getProperty('DOCASSIST_INSTRUCTIONS') || '';
-  const fileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
+  const fileScopeIds = getFileScopeIdsForThisDocument_();
   const selectedTabId = docProps.getProperty('DOCASSIST_SELECTED_TAB_ID') || '';
   const userProps = PropertiesService.getUserProperties();
   const activeChatId = userProps.getProperty('DOCASSIST_ACTIVE_CHAT_ID') || '';
@@ -1565,13 +1681,21 @@ function getSidebarState() {
     hasBaseUrl: Boolean(baseUrl),
     hasToken: Boolean(token),
     instructionsLen: String(instructions || '').length,
-    hasFileScope: Boolean(String(fileScopeId || '').trim()),
+    hasFileScope: Boolean(fileScopeIds.length),
     hasSelectedTab: Boolean(String(selectedTabId || '').trim()),
     hasActiveChat: Boolean(String(activeChatId || '').trim()),
     ms: Date.now() - started
   });
 
-  return { baseUrl: baseUrl, token: token, instructions: instructions, fileScopeId: fileScopeId, selectedTabId: selectedTabId, activeChatId: activeChatId };
+  return {
+    baseUrl: baseUrl,
+    token: token,
+    instructions: instructions,
+    fileScopeId: fileScopeIds.length === 1 ? fileScopeIds[0] : '',
+    fileScopeIds: fileScopeIds,
+    selectedTabId: selectedTabId,
+    activeChatId: activeChatId
+  };
 }
 
 // ====== MULTI-CHAT (global per user) ======
@@ -1642,6 +1766,45 @@ function getChatMessagesForCurrentUser(chatId) {
   return callBackendV2Get_('/v2/chats/' + encodeURIComponent(String(chatId)) + '/messages?userId=' + encodeURIComponent(String(userId)));
 }
 
+function normalizeFileScopeIds_(value) {
+  let rawValues = [];
+
+  if (Array.isArray(value)) {
+    rawValues = value;
+  } else if (value != null) {
+    const raw = String(value || '').trim();
+    if (!raw) return [];
+    if (raw.indexOf('[') === 0) {
+      try {
+        const parsed = JSON.parse(raw);
+        rawValues = Array.isArray(parsed) ? parsed : [parsed];
+      } catch (e) {
+        rawValues = raw.split(',');
+      }
+    } else {
+      rawValues = raw.split(',');
+    }
+  }
+
+  const out = [];
+  const seen = {};
+  for (let i = 0; i < rawValues.length; i++) {
+    const valueStr = String(rawValues[i] == null ? '' : rawValues[i]).trim();
+    if (!valueStr) continue;
+    if (!/^[0-9]+$/.test(valueStr)) continue;
+    if (seen[valueStr]) continue;
+    seen[valueStr] = true;
+    out.push(valueStr);
+  }
+  return out;
+}
+
+function getFileScopeIdsForThisDocument_() {
+  const docProps = PropertiesService.getDocumentProperties();
+  const raw = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
+  return normalizeFileScopeIds_(raw);
+}
+
 function sendChatMessageInChat(userMessage, instructionsOverride, fileScopeIdOverride, chatIdOverride) {
   const started = Date.now();
   const doc = DocumentApp.getActiveDocument();
@@ -1653,17 +1816,18 @@ function sendChatMessageInChat(userMessage, instructionsOverride, fileScopeIdOve
   if (!String(activeChat).trim()) throw new Error('No active chat. Create a new chat first.');
 
   const docProps = PropertiesService.getDocumentProperties();
-  const storedFileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
-  const fileScopeId = String(
-    (typeof fileScopeIdOverride === 'string' ? fileScopeIdOverride : '') || storedFileScopeId || ''
-  ).trim();
+  const storedFileScopeIds = getFileScopeIdsForThisDocument_();
+  const fileScopeIds = normalizeFileScopeIds_(
+    Array.isArray(fileScopeIdOverride) ? fileScopeIdOverride : (fileScopeIdOverride || storedFileScopeIds)
+  );
 
   const resp = callBackendV2_('/v2/chats/' + encodeURIComponent(String(activeChat)) + '/send', {
     userId: String(userId),
     userMessage: String(userMessage || ''),
     instructions: String(instructions || ''),
     docId: doc.getId(),
-    fileId: fileScopeId
+    fileIds: fileScopeIds,
+    fileId: fileScopeIds.length === 1 ? fileScopeIds[0] : ''
   });
 
   log_('v2.chat_thread.send', {
@@ -1678,14 +1842,18 @@ function sendChatMessageInChat(userMessage, instructionsOverride, fileScopeIdOve
   return resp;
 }
 
-function setFileScopeIdForThisDocument(fileScopeId) {
+function setFileScopeIdsForThisDocument(fileScopeIds) {
   const docProps = PropertiesService.getDocumentProperties();
-  const v = String(fileScopeId || '').trim();
-  if (!v) {
+  const ids = normalizeFileScopeIds_(fileScopeIds);
+  if (!ids.length) {
     docProps.deleteProperty('DOCASSIST_FILE_SCOPE_ID');
   } else {
-    docProps.setProperty('DOCASSIST_FILE_SCOPE_ID', v);
+    docProps.setProperty('DOCASSIST_FILE_SCOPE_ID', JSON.stringify(ids));
   }
+}
+
+function setFileScopeIdForThisDocument(fileScopeId) {
+  setFileScopeIdsForThisDocument(fileScopeId);
 }
 
 function setSelectedTabIdForThisDocument(tabId) {
@@ -2427,16 +2595,17 @@ function sendChatMessage(userMessage, instructionsOverride, fileScopeIdOverride)
   ensureV2Session_(instructions);
 
   const docProps = PropertiesService.getDocumentProperties();
-  const storedFileScopeId = docProps.getProperty('DOCASSIST_FILE_SCOPE_ID') || '';
-  const fileScopeId = String(
-    (typeof fileScopeIdOverride === 'string' ? fileScopeIdOverride : '') || storedFileScopeId || ''
-  ).trim();
+  const storedFileScopeIds = getFileScopeIdsForThisDocument_();
+  const fileScopeIds = normalizeFileScopeIds_(
+    Array.isArray(fileScopeIdOverride) ? fileScopeIdOverride : (fileScopeIdOverride || storedFileScopeIds)
+  );
 
   const resp = callBackendV2_('/v2/chat', {
     docId: doc.getId(),
     userMessage: String(userMessage || ''),
     instructions: instructions,
-    fileId: fileScopeId
+    fileIds: fileScopeIds,
+    fileId: fileScopeIds.length === 1 ? fileScopeIds[0] : ''
   });
 
   log_('v2.chat', {
