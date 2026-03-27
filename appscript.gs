@@ -2161,10 +2161,18 @@ function callBackendV2Get_(path) {
 }
 
 function getGeneratedFileDownloadForCurrentUser(containerId, fileId, filename) {
-  const url =
-    getBackendBaseUrl_() +
-    '/v2/generated-files/' + encodeURIComponent(String(containerId || '')) + '/' + encodeURIComponent(String(fileId || '')) +
-    '?filename=' + encodeURIComponent(String(filename || 'download.bin'));
+  const trimmedContainerId = String(containerId || '').trim();
+  const url = trimmedContainerId
+    ? (
+      getBackendBaseUrl_() +
+      '/v2/generated-files/' + encodeURIComponent(trimmedContainerId) + '/' + encodeURIComponent(String(fileId || '')) +
+      '?filename=' + encodeURIComponent(String(filename || 'download.bin'))
+    )
+    : (
+      getBackendBaseUrl_() +
+      '/v2/generated-files/openai/' + encodeURIComponent(String(fileId || '')) +
+      '?filename=' + encodeURIComponent(String(filename || 'download.bin'))
+    );
   const token = getBackendToken_();
 
   const headers = {};

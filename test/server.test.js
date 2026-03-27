@@ -197,6 +197,65 @@ test("POST /v2/chat returns generated spreadsheet files", async () => {
   ]);
 });
 
+test("POST /v2/chat returns generated files from file_path annotations", async () => {
+  const openaiClient = {
+    responses: {
+      async create() {
+        return {
+          id: "r_path",
+          output_text: "DOWNLOAD: [dbt_priority_kr_kpi_tv_pack.xlsx](sandbox:/mnt/data/dbt_priority_kr_kpi_tv_pack.xlsx)",
+          output: [
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "DOWNLOAD: [dbt_priority_kr_kpi_tv_pack.xlsx](sandbox:/mnt/data/dbt_priority_kr_kpi_tv_pack.xlsx)",
+                  annotations: [
+                    {
+                      type: "file_path",
+                      file_id: "file_path_1",
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock({
+      sessionRow: {
+        doc_id: "doc1",
+        conversation_id: "c1",
+        vector_store_id: "vs1",
+        instructions: "",
+        model: "test-model",
+      },
+    }),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "", openaiModel: "test-model" },
+  });
+
+  const res = await request(app)
+    .post("/v2/chat")
+    .send({ docId: "doc1", userMessage: "Create an Excel workbook." });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.generatedFiles, [
+    {
+      containerId: "",
+      fileId: "file_path_1",
+      filename: "dbt_priority_kr_kpi_tv_pack.xlsx",
+      isSpreadsheet: true,
+      downloadPath: "/v2/generated-files/openai/file_path_1?filename=dbt_priority_kr_kpi_tv_pack.xlsx",
+    },
+  ]);
+});
+
 test("GET /v2/generated-files streams container file downloads", async () => {
   const openaiClient = {
     containers: {
@@ -228,6 +287,44 @@ test("GET /v2/generated-files streams container file downloads", async () => {
   assert.equal(res.text, "a,b\n1,2\n");
   assert.match(res.headers["content-disposition"], /report\.csv/);
   assert.match(res.headers["content-type"], /text\/csv/i);
+});
+
+test("GET /v2/generated-files falls back to file content when container is expired", async () => {
+  const openaiClient = {
+    containers: {
+      files: {
+        content: {
+          async retrieve() {
+            const err = new Error("Container is expired.");
+            err.status = 404;
+            throw err;
+          },
+        },
+      },
+    },
+    files: {
+      async content(fileId) {
+        assert.equal(fileId, "file_1");
+        return new Response(Buffer.from("fallback-bytes"), {
+          headers: { "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+        });
+      },
+    },
+  };
+
+  const { app } = createApp({
+    pool: makePoolMock(),
+    openaiClient,
+    config: { bodyLimit: "10kb", token: "" },
+  });
+
+  const res = await request(app)
+    .get("/v2/generated-files/cont_1/file_1")
+    .query({ filename: "report.xlsx" });
+
+  assert.equal(res.status, 200);
+  assert.equal(res.text, "fallback-bytes");
+  assert.match(res.headers["content-disposition"], /report\.xlsx/);
 });
 
 test("POST /v2/chats/:chatId/send persists generated file metadata", async () => {

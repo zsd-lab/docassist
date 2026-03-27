@@ -590,28 +590,62 @@ c.) Coalition building through service
     for (const item of output) {
       const content = item && Array.isArray(item.content) ? item.content : [];
       for (const c of content) {
+        const text = String(c?.text || "");
         const annotations = c && Array.isArray(c.annotations) ? c.annotations : [];
         for (const ann of annotations) {
-          if (String(ann?.type || "").toLowerCase() !== "container_file_citation") continue;
-          const containerId = ann.container_id || ann.containerId;
+          const annType = String(ann?.type || "").toLowerCase();
           const fileId = ann.file_id || ann.fileId;
-          if (!containerId || !fileId) continue;
-          generatedFiles.push({
-            containerId: String(containerId),
-            fileId: String(fileId),
-            filename: String(ann.filename || fileId),
-          });
+          if (!fileId) continue;
+
+          if (annType === "container_file_citation") {
+            const containerId = ann.container_id || ann.containerId;
+            if (!containerId) continue;
+            generatedFiles.push({
+              containerId: String(containerId),
+              fileId: String(fileId),
+              filename: String(ann.filename || fileId),
+            });
+            continue;
+          }
+
+          if (annType === "file_path") {
+            const startIndex = Number.isFinite(Number(ann.start_index)) ? Number(ann.start_index) : null;
+            const endIndex = Number.isFinite(Number(ann.end_index)) ? Number(ann.end_index) : null;
+            const rawPath =
+              startIndex != null && endIndex != null && endIndex > startIndex
+                ? text.slice(startIndex, endIndex)
+                : text;
+            const filename = deriveGeneratedFilenameFromText_(rawPath, String(fileId));
+            generatedFiles.push({
+              containerId: "",
+              fileId: String(fileId),
+              filename,
+            });
+          }
         }
       }
     }
 
     const dedup = new Map();
     for (const file of generatedFiles) {
-      const key = `${file.containerId}::${file.fileId}`;
+      const key = `${String(file.containerId || "") || "openai-file"}::${file.fileId}`;
       if (!dedup.has(key)) dedup.set(key, file);
     }
 
     return Array.from(dedup.values());
+  }
+
+  function deriveGeneratedFilenameFromText_(rawText, fallback = "download.bin") {
+    const text = String(rawText || "").trim();
+    if (!text) return fallback;
+
+    const sandboxMatch = text.match(/sandbox:\/mnt\/data\/([^\]\)\s]+)/i);
+    if (sandboxMatch && sandboxMatch[1]) {
+      return safeDownloadFilename_(decodeURIComponent(String(sandboxMatch[1])), fallback);
+    }
+
+    const tail = text.split(/[\\/]/).pop() || text;
+    return safeDownloadFilename_(tail, fallback);
   }
 
   function isSpreadsheetLikeFilename_(filename) {
@@ -655,13 +689,15 @@ c.) Coalition building through service
   function decorateGeneratedFilesForResponse_(files) {
     const list = Array.isArray(files) ? files : [];
     return list.map((file) => ({
-      containerId: String(file.containerId),
+      containerId: String(file.containerId || ""),
       fileId: String(file.fileId),
       filename: String(file.filename || file.fileId),
       isSpreadsheet: isSpreadsheetLikeFilename_(file.filename),
-      downloadPath:
-        `/v2/generated-files/${encodeURIComponent(String(file.containerId))}/${encodeURIComponent(String(file.fileId))}` +
-        `?filename=${encodeURIComponent(String(file.filename || file.fileId || "download.bin"))}`,
+      downloadPath: String(file.containerId || "").trim()
+        ? (`/v2/generated-files/${encodeURIComponent(String(file.containerId))}/${encodeURIComponent(String(file.fileId))}` +
+          `?filename=${encodeURIComponent(String(file.filename || file.fileId || "download.bin"))}`)
+        : (`/v2/generated-files/openai/${encodeURIComponent(String(file.fileId))}` +
+          `?filename=${encodeURIComponent(String(file.filename || file.fileId || "download.bin"))}`),
     }));
   }
 
@@ -2360,6 +2396,44 @@ c.) Coalition building through service
     }
   });
   
+  async function streamGeneratedFileDownload_(req, res, { containerId, fileId, requestedFilename }) {
+    const safeFilename = safeDownloadFilename_(requestedFilename, String(fileId));
+
+    const sendUpstream_ = async (upstream) => {
+      const bodyBuffer = Buffer.from(await upstream.arrayBuffer());
+      const contentType = upstream.headers.get("content-type") || guessMimeTypeFromFilename_(safeFilename);
+      res.setHeader("Content-Type", contentType);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeFilename.replace(/"/g, "")}"`
+      );
+      return res.status(200).send(bodyBuffer);
+    };
+
+    if (String(containerId || "").trim()) {
+      try {
+        const upstream = await client.containers.files.content.retrieve(String(fileId), {
+          container_id: String(containerId),
+        });
+        return await sendUpstream_(upstream);
+      } catch (err) {
+        const status = Number(err?.status) || 0;
+        const msg = String(err?.message || "");
+        const containerExpired = status === 404 && /container.*expired/i.test(msg);
+        if (!containerExpired && status !== 404) throw err;
+      }
+    }
+
+    if (client?.files && typeof client.files.content === "function") {
+      const upstream = await client.files.content(String(fileId));
+      return await sendUpstream_(upstream);
+    }
+
+    const err = new Error("Generated file is no longer available for download");
+    err.status = 404;
+    throw err;
+  }
+
   app.get("/v2/generated-files/:containerId/:fileId", async (req, res) => {
     try {
       const containerId = requireNonEmptyTrimmedString(
@@ -2384,21 +2458,40 @@ c.) Coalition building through service
               allowEmpty: true,
             });
       if (typeof req.query.filename !== "undefined" && requestedFilename == null) return;
-  
-      const upstream = await client.containers.files.content.retrieve(String(fileId), {
-        container_id: String(containerId),
+
+      return await streamGeneratedFileDownload_(req, res, {
+        containerId: String(containerId),
+        fileId: String(fileId),
+        requestedFilename,
       });
-      const bodyBuffer = Buffer.from(await upstream.arrayBuffer());
-      const safeFilename = safeDownloadFilename_(requestedFilename, String(fileId));
-      const contentType =
-        upstream.headers.get("content-type") || guessMimeTypeFromFilename_(safeFilename);
-  
-      res.setHeader("Content-Type", contentType);
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${safeFilename.replace(/"/g, "")}"`
-      );
-      return res.status(200).send(bodyBuffer);
+    } catch (err) {
+      logger.error(err);
+      const status = Number(err?.status) || 500;
+      return res.status(status).json(jsonError(req, err.message || "Internal server error"));
+    }
+  });
+
+  app.get("/v2/generated-files/openai/:fileId", async (req, res) => {
+    try {
+      const fileId = requireNonEmptyTrimmedString(req, res, "fileId", req.params.fileId, {
+        maxChars: 200,
+      });
+      if (fileId == null) return;
+
+      const requestedFilename =
+        typeof req.query.filename === "undefined"
+          ? null
+          : requireString(req, res, "filename", req.query.filename, {
+              maxChars: 255,
+              allowEmpty: true,
+            });
+      if (typeof req.query.filename !== "undefined" && requestedFilename == null) return;
+
+      return await streamGeneratedFileDownload_(req, res, {
+        containerId: "",
+        fileId: String(fileId),
+        requestedFilename,
+      });
     } catch (err) {
       logger.error(err);
       const status = Number(err?.status) || 500;
